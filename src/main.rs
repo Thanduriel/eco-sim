@@ -1,21 +1,27 @@
 use bevy::light::CascadeShadowConfigBuilder;
+use bevy::math::f32;
 use bevy::prelude::*;
 use bevy::render::render_resource::Face;
+use bevy_prng::WyRand;
+use bevy_rand::prelude::*;
 use std::f32::consts::PI;
+use rand::prelude::*;
 
 use crate::camera_controller::*;
-use crate::organism::GrassAssets;
+use crate::grass::{GrassAssets, create_grass_mesh};
 use crate::terrain::*;
 
 mod camera_controller;
+mod grass;
 mod organism;
 mod terrain;
 
 fn main() {
     App::new()
-        .insert_resource(organism::GrassAssets::default())
+        .insert_resource(grass::GrassAssets::default())
         .add_plugins(DefaultPlugins)
         .add_plugins(CameraControllerPlugin)
+        .add_plugins(EntropyPlugin::<WyRand>::default())
         .add_systems(Startup, setup)
         .add_systems(Update, input_system)
         .add_systems(Update, organism::update_organisms)
@@ -34,9 +40,9 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut grass_assets: ResMut<organism::GrassAssets>,
+    mut grass_assets: ResMut<grass::GrassAssets>,
 ) {
-    grass_assets.mesh = meshes.add(Cuboid::new(0.05, 0.5, 0.05));
+    grass_assets.mesh = meshes.add(create_grass_mesh()); //meshes.add(Cuboid::new(0.05, 0.5, 0.05));
     grass_assets.material = materials.add(Color::linear_rgb(0.0, 1.0, 0.0));
     // circular base
     commands.spawn((
@@ -108,6 +114,7 @@ fn input_system(
     camera_query: Query<(&Camera, &GlobalTransform)>,
     window_query: Query<&Window>,
     mouse_button_input: Res<ButtonInput<MouseButton>>,
+    mut rng: Single<&mut WyRand, With<GlobalRng>>,
 ) {
     if !mouse_button_input.just_released(MouseButton::Right) {
         return;
@@ -147,7 +154,12 @@ fn input_system(
         commands.spawn((
             Mesh3d(grass_assets.mesh.clone()),
             MeshMaterial3d(grass_assets.material.clone()),
-            Transform::from_translation(hit.point).with_scale(Vec3::ONE),
+            Transform::from_translation(hit.point)
+                .with_scale(Vec3::ZERO)
+                .with_rotation(Quat::from_axis_angle(
+                    Vec3::new(0.0, 1.0, 0.0),
+                    rng.random::<f32>()  * 2.0 * PI,
+                )),
             organism::Organism::default(),
         ));
     }
