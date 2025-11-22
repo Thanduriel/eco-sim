@@ -1,11 +1,5 @@
 use bevy::prelude::*;
 
-#[derive(Resource, Default)]
-pub struct GrassAssets {
-    pub mesh: Handle<Mesh>,
-    pub material: Handle<StandardMaterial>,
-}
-
 #[derive(Component, Default)]
 pub struct Organism {
     age: f32,
