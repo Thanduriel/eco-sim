@@ -4,14 +4,15 @@ use bevy::prelude::*;
 use bevy::render::render_resource::Face;
 use bevy_prng::WyRand;
 use bevy_rand::prelude::*;
-use std::f32::consts::PI;
 use rand::prelude::*;
+use std::f32::consts::PI;
 
 use crate::camera_controller::*;
-use crate::grass::{GrassAssets, create_grass_mesh};
+use crate::grass::{GrassAssets, create_grass_material, create_grass_mesh};
 use crate::terrain::*;
 
 mod camera_controller;
+mod domain;
 mod grass;
 mod organism;
 mod terrain;
@@ -19,12 +20,14 @@ mod terrain;
 fn main() {
     App::new()
         .insert_resource(grass::GrassAssets::default())
+        .insert_resource(Time::<Fixed>::from_hz(60.0))
         .add_plugins(DefaultPlugins)
         .add_plugins(CameraControllerPlugin)
         .add_plugins(EntropyPlugin::<WyRand>::default())
         .add_systems(Startup, setup)
         .add_systems(Update, input_system)
-        .add_systems(Update, organism::update_organisms)
+        .add_systems(FixedUpdate, organism::update_organisms)
+        .add_systems(FixedUpdate, organism::propagate_organisms)
         .run();
 }
 /*
@@ -42,8 +45,8 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut grass_assets: ResMut<grass::GrassAssets>,
 ) {
-    grass_assets.mesh = meshes.add(create_grass_mesh()); //meshes.add(Cuboid::new(0.05, 0.5, 0.05));
-    grass_assets.material = materials.add(Color::linear_rgb(0.0, 1.0, 0.0));
+    grass_assets.mesh = meshes.add(create_grass_mesh(2)); //meshes.add(Cuboid::new(0.05, 0.5, 0.05));
+    grass_assets.material = materials.add(create_grass_material());
     // circular base
     commands.spawn((
         Mesh3d(meshes.add(Circle::new(4.0))),
@@ -60,18 +63,21 @@ fn setup(
     // terrain
     let terrain_material = StandardMaterial {
         alpha_mode: AlphaMode::Opaque,
-        double_sided: true,
+        double_sided: false,
         perceptual_roughness: 1.0,
         reflectance: 0.4,
         cull_mode: Some(Face::Back),
         flip_normal_map_y: true,
         ..default()
     };
+
+    let terrain = Terrain::new(3);
     commands.spawn((
-        Mesh3d(meshes.add(generate_terrain_mesh(-32.0, -32.0, 64.0, 512))),
+        //   Mesh3d(meshes.add(generate_terrain_mesh(domain::BOUNDS.min, domain::BOUNDS.size(), 512))),
+        Mesh3d(meshes.add(generate_terrain_mesh(&terrain.height_map))),
         MeshMaterial3d(materials.add(terrain_material)),
-        Transform::from_xyz(0.0, 0.0, 0.0),
-        Terrain {},
+        Transform::from_xyz(domain::HALF_SIZE.x as f32, 0.0, domain::HALF_SIZE.y as f32),
+        terrain,
     ));
 
     // point light
@@ -158,7 +164,7 @@ fn input_system(
                 .with_scale(Vec3::ZERO)
                 .with_rotation(Quat::from_axis_angle(
                     Vec3::new(0.0, 1.0, 0.0),
-                    rng.random::<f32>()  * 2.0 * PI,
+                    rng.random::<f32>() * 2.0 * PI,
                 )),
             organism::Organism::default(),
         ));
