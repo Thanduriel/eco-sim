@@ -11,6 +11,11 @@ pub struct Terrain {
     pub height_map: domain::Field<f32>,
 }
 
+#[derive(Component)]
+pub struct Surface {
+    pub veg_density: domain::Field<f32>,
+}
+
 fn get_terrain_height(noise_map: &NoiseMap, x: usize, y: usize) -> f32 {
     2.5 * noise_map.get_value(x, y) as f32
 }
@@ -28,17 +33,17 @@ impl Terrain {
         let noise_fn = noise::HybridMulti::<noise::Perlin>::default();
 
         let noise_map: NoiseMap = noise::utils::PlaneMapBuilder::new(noise_fn)
-            .set_size(height_map.size.x as usize, height_map.size.y as usize)
+            .set_size(height_map.size.x, height_map.size.y)
             .set_x_bounds(0.0, domain::SIZE.x as f64 / 32.0) // bounds just determine the frequency
             .set_y_bounds(0.0, domain::SIZE.y as f64 / 32.0)
             .build();
 
         for y in 0..height_map.size.y {
             for x in 0..height_map.size.x {
-                height_map[(x, y)] = get_terrain_height(
+                height_map[[x, y]] = get_terrain_height(
                     &noise_map,
-                    x as usize,
-                    y as usize,
+                    x,
+                    y,
                 );
             }
         }
@@ -98,13 +103,13 @@ pub fn generate_terrain_mesh(start_pos: Vec2, size: Vec2, subdivisions: u32) -> 
 }*/
 
 pub fn generate_terrain_mesh(height_map: &domain::Field<f32>) -> Mesh {
-    let num_vertices: usize = (height_map.size.x as usize + 2) * (height_map.size.y as usize + 2);
+    let num_vertices: usize = (height_map.size.x + 2) * (height_map.size.y + 2);
     //let mut uvs: Vec<[f32;2]> = Vec::with_capacity(num_vertices);
     let mut vertex_colors: Vec<[f32; 4]> = Vec::with_capacity(num_vertices);
     let mut mesh: Mesh = Plane3d::default()
         .mesh()
         .size(domain::SIZE.x as f32, domain::SIZE.y as f32)
-        .subdivisions(height_map.size.x - 1)
+        .subdivisions((height_map.size.x - 1) as u32)
         .into();
     // get positions
     let pos_attr = mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION).unwrap();

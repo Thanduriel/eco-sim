@@ -1,12 +1,14 @@
+use bevy::math::{FloatPow, USizeVec2};
 use bevy::prelude::*;
-use std::ops::{Index, IndexMut};
+use num_traits::NumAssign;
+use std::ops::{Index, IndexMut, Mul};
 
-const SIZE_POW: UVec2 = UVec2 { x: 6, y: 6 };
-pub const SIZE: UVec2 = UVec2 {
+const SIZE_POW: USizeVec2 = USizeVec2 { x: 6, y: 6 };
+pub const SIZE: USizeVec2 = USizeVec2 {
     x: 1 << (SIZE_POW.x),
     y: 1 << (SIZE_POW.y),
 };
-pub const HALF_SIZE: UVec2 = UVec2 {
+pub const HALF_SIZE: USizeVec2 = USizeVec2 {
     x: SIZE.x >> 1,
     y: SIZE.y >> 1,
 };
@@ -24,45 +26,81 @@ pub const BOUNDS: Rect = Rect {
 
 pub struct Field<T> {
     buffer: Vec<T>,
-//    subdivisions: i32,
+    //    subdivisions: i32,
     pub idx_scale: f32,
-    pub size: UVec2,
+    pub size: USizeVec2,
 }
+/*
+trait FieldType:
+    Default + Copy + NumAssign {
+}*/
 
-impl<T: Default + Copy> Field<T> {
+impl<T: Default + Copy + NumAssign> Field<T> {
     pub fn new(subdivisions: i32) -> Self {
-        let size = UVec2::new(
-            1 << (SIZE_POW.x as i32 + subdivisions) as u32,
-            1 << (SIZE_POW.y as i32 + subdivisions) as u32,
+        let size = USizeVec2::new(
+            1 << (SIZE_POW.x as i32 + subdivisions) as usize,
+            1 << (SIZE_POW.y as i32 + subdivisions) as usize,
         );
 
         Field {
-            buffer: vec![T::default(); size.x as usize * size.y as usize],
-     //       subdivisions: subdivisions,
+            buffer: vec![T::default(); size.x * size.y],
+            //       subdivisions: subdivisions,
             idx_scale: 2.0_f32.powf(subdivisions as f32),
             size: size,
         }
     }
 
-    pub fn get_nearest(&self, pos : Vec2) -> T {
-        let x = ((pos.x * self.idx_scale).round() as usize).clamp(0, self.size.x as usize - 1);
-        let y = ((pos.y * self.idx_scale).round() as usize).clamp(0, self.size.y as usize - 1);
-        self.buffer[x + y * self.size.x as usize]
+    fn clamp_index(&self, idx: USizeVec2) -> USizeVec2 {
+        idx.clamp(USizeVec2::ZERO, self.size - USizeVec2::ONE)
+    }
+
+    fn flat_index(&self, idx: USizeVec2) -> usize {
+        idx.x + idx.y * self.size.x
+    }
+
+    /*fn flat_index(&self, idx : [usize; 2]) -> usize {
+        idx[0] + idx[1] * self.size.x
+    }*/
+
+    pub fn get_nearest(&self, pos: Vec2) -> T {
+        let idx = self.clamp_index((pos * self.idx_scale).round().as_usizevec2());
+        self.buffer[self.flat_index(idx)]
     }
 }
 
-impl<T> Index<(u32, u32)> for Field<T> {
+impl<T: Default + Copy + NumAssign + Mul<f32, Output = T>> Field<T> {
+    pub fn add_kernel(&mut self, pos: Vec2, radius: f32, value: T) {
+        let pos_local = pos * Vec2::splat(self.idx_scale);
+        let r_local = radius * self.idx_scale;
+        let min_pos_local = pos_local - Vec2::splat(r_local);
+        let max_pos_local = pos_local + Vec2::splat(r_local);
+        let min_idx = self.clamp_index((min_pos_local).floor().as_usizevec2());
+        let max_idx = self.clamp_index((max_pos_local).ceil().as_usizevec2());
+
+        let r_sq = r_local.squared();
+        for iy in min_idx.y..max_idx.y {
+            for ix in min_idx.x..max_idx.x {
+                let d_sq = pos_local.distance_squared(vec2(ix as f32, iy as f32));
+                if d_sq < r_sq {
+                    let flat_idx = self.flat_index(USizeVec2::new(ix, iy));
+                    self.buffer[flat_idx] += value * (1.0 - d_sq / r_sq);
+                }
+            }
+        }
+    }
+}
+
+impl<T: Default + Copy + NumAssign> Index<[usize; 2]> for Field<T> {
     type Output = T;
 
-    fn index(&self, index: (u32, u32)) -> &T {
-        let (x,y) = index;
-        &self.buffer[x as usize + y as usize * self.size.x as usize]
+    fn index(&self, index: [usize; 2]) -> &T {
+        &self.buffer[self.flat_index(index.into())]
     }
 }
 
-impl<T> IndexMut<(u32, u32)> for Field<T> {
-    fn index_mut(&mut self, index: (u32, u32)) -> &mut T {
-        let (x,y) = index;
-        &mut self.buffer[x as usize + y as usize * self.size.x as usize]
+impl<T: Default + Copy + NumAssign> IndexMut<[usize; 2]> for Field<T> {
+    fn index_mut(&mut self, index: [usize; 2]) -> &mut T {
+        let flat_idx = self.flat_index(index.into());
+        &mut self.buffer[flat_idx]
     }
 }

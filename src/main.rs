@@ -78,6 +78,9 @@ fn setup(
         MeshMaterial3d(materials.add(terrain_material)),
         Transform::from_xyz(domain::HALF_SIZE.x as f32, 0.0, domain::HALF_SIZE.y as f32),
         terrain,
+        Surface {
+            veg_density: domain::Field::new(3),
+        },
     ));
 
     // point light
@@ -160,7 +163,7 @@ fn input_system(
         commands.spawn((
             Mesh3d(grass_assets.mesh.clone()),
             MeshMaterial3d(grass_assets.material.clone()),
-            Transform::from_translation(hit.point)
+            Transform::from_translation(hit.point - vec3(0.0, 0.1, 0.0))
                 .with_scale(Vec3::ZERO)
                 .with_rotation(Quat::from_axis_angle(
                     Vec3::new(0.0, 1.0, 0.0),

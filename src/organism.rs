@@ -3,7 +3,7 @@ use bevy_prng::WyRand;
 use bevy_rand::prelude::*;
 use rand::prelude::*;
 use std::f32::consts::PI;
-use crate::Terrain;
+use crate::{Terrain, Surface};
 
 #[derive(Component, Default)]
 pub struct Organism {
@@ -36,10 +36,12 @@ pub fn propagate_organisms(
     mut commands: Commands,
     organism_query: Query<(&Transform, &Organism)>,
     terrain_query: Query<&Terrain>,
+    mut surface_query: Query<&mut Surface>,
     mut rng: Single<&mut WyRand, With<GlobalRng>>,
     grass_assets: Res<crate::GrassAssets>,
 ) {
     let terrain = terrain_query.single().unwrap();
+    let mut surface = surface_query.single_mut().unwrap();
 
     for (transform, organism) in organism_query.iter() {
         if organism.age < MIN_PROPAGATION_AGE {
@@ -48,13 +50,18 @@ pub fn propagate_organisms(
         if rng.random::<f32>() >= SPAWN_PROP {
             continue;
         }
+        
         let area = Circle::new(1.0);
         let p = area.sample_interior(&mut rng) + transform.translation.xz();
+        if surface.veg_density.get_nearest(p) > 0.5 {
+            continue;
+        }
+
         commands.spawn((
             Mesh3d(grass_assets.mesh.clone()),
             MeshMaterial3d(grass_assets.material.clone()),
             Transform::from_translation(
-                Vec3::new(p.x, terrain.height_map.get_nearest(p), p.y),
+                Vec3::new(p.x, terrain.height_map.get_nearest(p) - 0.1, p.y),
             )
             .with_scale(Vec3::ZERO)
             .with_rotation(Quat::from_axis_angle(
@@ -63,5 +70,8 @@ pub fn propagate_organisms(
             )),
             Organism::default(),
         ));
+        println!("{}", surface.veg_density.get_nearest(p));
+        surface.veg_density.add_kernel(p, 0.125, 1.0);
+        println!("{}", surface.veg_density.get_nearest(p));
     }
 }
