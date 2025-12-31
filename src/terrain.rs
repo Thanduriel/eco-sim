@@ -3,7 +3,7 @@ use bevy::prelude::*;
 //use bevy::render::render_resource::PrimitiveTopology;
 use bevy::mesh::VertexAttributeValues;
 
-use crate::domain;
+use crate::{color_map, domain};
 use noise::utils::{NoiseMap, NoiseMapBuilder};
 
 #[derive(Component)]
@@ -40,11 +40,7 @@ impl Terrain {
 
         for y in 0..height_map.size.y {
             for x in 0..height_map.size.x {
-                height_map[[x, y]] = get_terrain_height(
-                    &noise_map,
-                    x,
-                    y,
-                );
+                height_map[[x, y]] = get_terrain_height(&noise_map, x, y);
             }
         }
 
@@ -59,50 +55,56 @@ fn get_terrain_color(height: f32) -> Color {
     let t = (height - BOUNDARY_START).clamp(0.0, 1.0);
     COLOR_SAND.mix(&COLOR_BEDROCK, t)
 }
-/*
-pub fn generate_terrain_mesh(start_pos: Vec2, size: Vec2, subdivisions: u32) -> Mesh {
-    //let fbm = noise::Fbm::<noise::Fbm<noise::Perlin>>::default();
-    let noise_fn = noise::HybridMulti::<noise::Perlin>::default();
 
-    let noise_map: NoiseMap = noise::utils::PlaneMapBuilder::new(noise_fn)
-        .set_size(subdivisions as usize, subdivisions as usize)
-        .set_x_bounds(-1.0, 1.0) //(x + size) as f64)
-        .set_y_bounds(-1.0, 1.0) //(z + size) as f64)
-        .build();
+pub fn reset_terrain_color(mesh: &mut Mesh) {
+    let mut color_attr = mesh.remove_attribute(Mesh::ATTRIBUTE_COLOR).unwrap();
+    let VertexAttributeValues::Float32x4(ref mut col_attr_vec) = color_attr else {
+        panic!("Unexpected vertex format, expected Float32x4");
+    };
 
-    let num_vertices: usize = (subdivisions as usize + 2) * (subdivisions as usize + 2);
-    //let mut uvs: Vec<[f32;2]> = Vec::with_capacity(num_vertices);
-    let mut vertex_colors: Vec<[f32; 4]> = Vec::with_capacity(num_vertices);
-    let mut mesh: Mesh = Plane3d::default()
-        .mesh()
-        .size(size.x, size.y)
-        .subdivisions(subdivisions)
-        .into();
-    // get positions
-    let pos_attr = mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION).unwrap();
+    let pos_attr = mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap();
     let VertexAttributeValues::Float32x3(pos_attr_vec) = pos_attr else {
         panic!("Unexpected vertex format, expected Float32x3");
     };
-    // modify y with height sampling
-    let r = (subdivisions as f32) / size;
-    for pos in pos_attr_vec.iter_mut() {
-        pos[1] = get_terrain_height(
-            &noise_map,
-            r.x * (pos[0] - start_pos.x),
-            r.y * (pos[2] - start_pos.y),
-        );
-        vertex_colors.push(get_terrain_color(pos[1]).to_linear().to_f32_array());
+
+    for (pos, col) in pos_attr_vec.iter().zip(col_attr_vec.iter_mut()) {
+        *col = get_terrain_color(pos[1]).to_linear().to_f32_array();
     }
 
-    //mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vertex_colors);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, color_attr);
+}
 
-    let _ = mesh.generate_tangents();
+pub fn set_terrain_color(mesh: &mut Mesh, color_values: &domain::Field<f32>) {
+    let mut color_attr = mesh.remove_attribute(Mesh::ATTRIBUTE_COLOR).unwrap();
+    let VertexAttributeValues::Float32x4(ref mut col_attr_vec) = color_attr else {
+        panic!("Unexpected vertex format, expected Float32x4");
+    };
 
-    mesh
-}*/
+    let pos_attr = mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap();
+    let VertexAttributeValues::Float32x3(pos_attr_vec) = pos_attr else {
+        panic!("Unexpected vertex format, expected Float32x3");
+    };
 
-pub fn generate_terrain_mesh(height_map: &domain::Field<f32>) -> Mesh {
+    let (min, max) = color_values.compute_min_max();
+    let cmap = color_map::ColorMap::new(min, max, color_map::ColorScheme::Incandescent);
+
+    for (pos, col) in pos_attr_vec.iter().zip(col_attr_vec.iter_mut()) {
+        let pos_domain = Vec2::new(
+            pos[0] + domain::HALF_SIZE.x as f32,
+            pos[2] + domain::HALF_SIZE.y as f32,
+        );
+
+        *col = cmap
+            .get_color(color_values.get_nearest(pos_domain))
+            .to_f32_array();
+    }
+
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, color_attr);
+}
+
+pub fn generate_terrain_mesh(
+    height_map: &domain::Field<f32>,
+) -> Mesh {
     let num_vertices: usize = (height_map.size.x + 2) * (height_map.size.y + 2);
     //let mut uvs: Vec<[f32;2]> = Vec::with_capacity(num_vertices);
     let mut vertex_colors: Vec<[f32; 4]> = Vec::with_capacity(num_vertices);
@@ -116,13 +118,17 @@ pub fn generate_terrain_mesh(height_map: &domain::Field<f32>) -> Mesh {
     let VertexAttributeValues::Float32x3(pos_attr_vec) = pos_attr else {
         panic!("Unexpected vertex format, expected Float32x3");
     };
+
     // modify y with height sampling
     for pos in pos_attr_vec.iter_mut() {
-        pos[1] = height_map.get_nearest(Vec2::new(
+        let pos_domain = Vec2::new(
             pos[0] + domain::HALF_SIZE.x as f32,
             pos[2] + domain::HALF_SIZE.y as f32,
-        ));
-        vertex_colors.push(get_terrain_color(pos[1]).to_linear().to_f32_array());
+        );
+        let h = height_map.get_nearest(pos_domain);
+        pos[1] = h;
+
+        vertex_colors.push(get_terrain_color(h).to_linear().to_f32_array());
     }
 
     //mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
