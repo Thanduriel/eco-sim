@@ -4,6 +4,7 @@ use bevy_rand::prelude::*;
 use rand::prelude::*;
 use std::f32::consts::PI;
 use crate::{Terrain, Surface};
+use crate::domain;
 
 #[derive(Component, Default)]
 pub struct Organism {
@@ -53,12 +54,16 @@ pub fn propagate_organisms(
         
         let area = Circle::new(1.0);
         let p = area.sample_interior(&mut rng) + transform.translation.xz();
+        if !domain::BOUNDS.contains(p) {
+            continue;
+        }
         if surface.veg_density.get_nearest(p) > 0.5 {
             continue;
         }
 
         commands.spawn((
             Mesh3d(grass_assets.mesh.clone()),
+            bevy::light::NotShadowCaster::default(),
             MeshMaterial3d(grass_assets.material.clone()),
             Transform::from_translation(
                 Vec3::new(p.x, terrain.height_map.get_nearest(p) - 0.1, p.y),
@@ -70,8 +75,6 @@ pub fn propagate_organisms(
             )),
             Organism::default(),
         ));
-        println!("{}", surface.veg_density.get_nearest(p));
         surface.veg_density.add_kernel(p, 0.125, 1.0);
-        println!("{}", surface.veg_density.get_nearest(p));
     }
 }

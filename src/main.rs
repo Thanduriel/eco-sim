@@ -12,6 +12,7 @@ use crate::grass::{GrassAssets, create_grass_material, create_grass_mesh};
 use crate::terrain::*;
 
 mod camera_controller;
+mod color_map;
 mod domain;
 mod grass;
 mod organism;
@@ -19,13 +20,20 @@ mod terrain;
 
 fn main() {
     App::new()
+        .insert_resource(AmbientLight {
+            brightness: 250.,
+            ..default()
+        })
         .insert_resource(grass::GrassAssets::default())
         .insert_resource(Time::<Fixed>::from_hz(60.0))
+        .insert_resource(FieldVisState::default())
         .add_plugins(DefaultPlugins)
         .add_plugins(CameraControllerPlugin)
         .add_plugins(EntropyPlugin::<WyRand>::default())
+        //      .add_plugins(ScreenSpaceAmbientOcclusionPlugin)
         .add_systems(Startup, setup)
         .add_systems(Update, input_system)
+        .add_systems(Update, vis_fields_system)
         .add_systems(FixedUpdate, organism::update_organisms)
         .add_systems(FixedUpdate, organism::propagate_organisms)
         .run();
@@ -45,7 +53,7 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut grass_assets: ResMut<grass::GrassAssets>,
 ) {
-    grass_assets.mesh = meshes.add(create_grass_mesh(2)); //meshes.add(Cuboid::new(0.05, 0.5, 0.05));
+    grass_assets.mesh = meshes.add(create_grass_mesh(2));
     grass_assets.material = materials.add(create_grass_material());
     // circular base
     commands.spawn((
@@ -62,18 +70,17 @@ fn setup(
 
     // terrain
     let terrain_material = StandardMaterial {
-        alpha_mode: AlphaMode::Opaque,
+        //   alpha_mode: AlphaMode::Opaque,
         double_sided: false,
         perceptual_roughness: 1.0,
         reflectance: 0.4,
         cull_mode: Some(Face::Back),
-        flip_normal_map_y: true,
+        //    flip_normal_map_y: true,
         ..default()
     };
 
     let terrain = Terrain::new(3);
     commands.spawn((
-        //   Mesh3d(meshes.add(generate_terrain_mesh(domain::BOUNDS.min, domain::BOUNDS.size(), 512))),
         Mesh3d(meshes.add(generate_terrain_mesh(&terrain.height_map))),
         MeshMaterial3d(materials.add(terrain_material)),
         Transform::from_xyz(domain::HALF_SIZE.x as f32, 0.0, domain::HALF_SIZE.y as f32),
@@ -112,7 +119,53 @@ fn setup(
         Camera3d::default(),
         Transform::from_xyz(-2.5, 4.5, 9.0).looking_at(Vec3::ZERO, Vec3::Y),
         CameraController::default(),
+        Msaa::Off,
+        bevy::pbr::ScreenSpaceAmbientOcclusion {
+            quality_level: bevy::pbr::ScreenSpaceAmbientOcclusionQualityLevel::High,
+            constant_object_thickness: 4.0,
+        },
     ));
+}
+
+#[derive(Default, PartialEq)]
+enum FieldType {
+    #[default]
+    None,
+    Reset,
+    VegDensity,
+}
+
+#[derive(Resource, Default)]
+struct FieldVisState {
+    field_type: FieldType,
+}
+
+fn vis_fields_system(
+    mut meshes: ResMut<Assets<Mesh>>,
+    terrain_query: Query<(&Mesh3d, &Surface), With<Terrain>>,
+    key_input: Res<ButtonInput<KeyCode>>,
+    mut field_vis_state: ResMut<FieldVisState>,
+) {
+    // switch debug coloring
+    if key_input.pressed(KeyCode::F1) {
+        field_vis_state.field_type = FieldType::Reset;
+    }
+    if key_input.pressed(KeyCode::F2) {
+        field_vis_state.field_type = FieldType::VegDensity;
+    }
+
+    if field_vis_state.field_type == FieldType::None {
+        return;
+    }
+
+    let (mesh3d, surface) = terrain_query.single().unwrap();
+    if let Some(mut mesh) = meshes.get_mut(&mesh3d.0) {
+        match field_vis_state.field_type {
+            FieldType::None => panic!(),
+            FieldType::Reset => reset_terrain_color(&mut mesh),
+            FieldType::VegDensity => set_terrain_color(&mut mesh, &surface.veg_density),
+        };
+    }
 }
 
 fn input_system(
@@ -162,6 +215,7 @@ fn input_system(
     for (_, hit) in hits {
         commands.spawn((
             Mesh3d(grass_assets.mesh.clone()),
+            bevy::light::NotShadowCaster::default(),
             MeshMaterial3d(grass_assets.material.clone()),
             Transform::from_translation(hit.point - vec3(0.0, 0.1, 0.0))
                 .with_scale(Vec3::ZERO)

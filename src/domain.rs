@@ -1,6 +1,6 @@
 use bevy::math::{FloatPow, USizeVec2};
 use bevy::prelude::*;
-use num_traits::NumAssign;
+use num_traits::{Bounded, NumAssign};
 use std::ops::{Index, IndexMut, Mul};
 
 const SIZE_POW: USizeVec2 = USizeVec2 { x: 6, y: 6 };
@@ -12,17 +12,14 @@ pub const HALF_SIZE: USizeVec2 = USizeVec2 {
     x: SIZE.x >> 1,
     y: SIZE.y >> 1,
 };
-/*
+
 pub const BOUNDS: Rect = Rect {
-    min: Vec2 {
-        x: -(HALF_SIZE.x as f32),
-        y: -(HALF_SIZE.y as f32),
-    },
+    min: Vec2 { x: 0.0, y: 0.0 },
     max: Vec2 {
-        x: HALF_SIZE.x as f32,
-        y: HALF_SIZE.y as f32,
+        x: SIZE.x as f32,
+        y: SIZE.y as f32,
     },
-};*/
+};
 
 pub struct Field<T> {
     buffer: Vec<T>,
@@ -65,6 +62,26 @@ impl<T: Default + Copy + NumAssign> Field<T> {
     pub fn get_nearest(&self, pos: Vec2) -> T {
         let idx = self.clamp_index((pos * self.idx_scale).round().as_usizevec2());
         self.buffer[self.flat_index(idx)]
+    }
+}
+
+impl<T: Copy + Bounded + std::cmp::PartialOrd> Field<T> {
+    pub fn compute_min_max(&self) -> (T, T) {
+        let min = self.buffer.iter().fold(T::max_value(), |a, &b| {
+            match PartialOrd::partial_cmp(&a, &b) {
+                None => a,
+                Some(std::cmp::Ordering::Less) => a,
+                Some(_) => b,
+            }
+        });
+        let max = self.buffer.iter().fold(T::min_value(), |a, &b| {
+            match PartialOrd::partial_cmp(&a, &b) {
+                None => a,
+                Some(std::cmp::Ordering::Less) => b,
+                Some(_) => a,
+            }
+        });
+        (min, max)
     }
 }
 
