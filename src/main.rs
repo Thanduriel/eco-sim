@@ -53,7 +53,7 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut grass_assets: ResMut<grass::GrassAssets>,
 ) {
-    grass_assets.mesh = meshes.add(create_grass_mesh(2));
+    grass_assets.mesh = meshes.add(create_grass_mesh(4, 0.15));
     grass_assets.material = materials.add(create_grass_material());
     // circular base
     commands.spawn((
