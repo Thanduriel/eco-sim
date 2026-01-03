@@ -5,6 +5,7 @@ use bevy_prng::WyRand;
 use bevy_rand::prelude::*;
 use rand::prelude::*;
 use std::f32::consts::PI;
+use crate::grass;
 
 #[derive(Component, Default)]
 pub struct Organism {
@@ -12,18 +13,24 @@ pub struct Organism {
 }
 
 const MAX_SIZE: f32 = 1.0;
-const MAX_AGE: f32 = 60.0;
 
 pub fn update_organisms(
     time: Res<Time>,
     mut commands: Commands,
+    mut surface_query: Query<&mut Surface>,
     mut organism_query: Query<(Entity, &mut Transform, &mut Organism)>,
 ) {
+    let mut surface = surface_query.single_mut().unwrap();
+
     for (id, mut transform, mut organism) in organism_query.iter_mut() {
         organism.age += time.delta_secs();
         transform.scale = Vec3::ONE * organism.age.min(MAX_SIZE);
 
-        if organism.age > MAX_AGE {
+        // death
+        if organism.age > grass::MAX_AGE {
+            let p = transform.translation.xz();
+            surface.veg_density.add_kernel(p, grass::SURFACE_AREA, -1.0);
+            // delete entity
             commands.entity(id).despawn();
         }
     }
@@ -52,8 +59,7 @@ pub fn propagate_organisms(
             continue;
         }
 
-        const SPAWN_RADIUS: f32 = 1.0;
-        let area = Circle::new(SPAWN_RADIUS);
+        let area = Circle::new(grass::SPAWN_RADIUS);
         let p = area.sample_interior(&mut rng) + transform.translation.xz();
         if !domain::BOUNDS.contains(p) {
             continue;
@@ -62,25 +68,25 @@ pub fn propagate_organisms(
             continue;
         }
 
-        const ORIENTATION_MAX_RADIUS: f32 = 0.1;
-        let axis_circle = Circle::new(ORIENTATION_MAX_RADIUS);
+        let axis_circle = Circle::new(grass::ORIENTATION_MAX_RADIUS);
         let tip = axis_circle.sample_interior(&mut rng);
         let axis = Vec3::new(tip.x, 1.0, tip.y).normalize();
 
-        const BELOW_SURFACE_DEPTH: f32 = 0.08;
         commands.spawn((
             Mesh3d(grass_assets.mesh.clone()),
             bevy::light::NotShadowCaster::default(),
             MeshMaterial3d(grass_assets.material.clone()),
             Transform::from_translation(Vec3::new(
                 p.x,
-                terrain.height_map.get_nearest(p) - BELOW_SURFACE_DEPTH,
+                terrain.height_map.get_nearest(p) - grass::BELOW_SURFACE_DEPTH,
                 p.y,
             ))
             .with_scale(Vec3::ZERO)
             .with_rotation(Quat::from_axis_angle(axis, rng.random::<f32>() * 2.0 * PI)),
             Organism::default(),
         ));
-        surface.veg_density.add_kernel(p, 0.125, 1.0);
+
+        // add surface space usage
+        surface.veg_density.add_kernel(p, grass::SURFACE_AREA, 1.0);
     }
 }
