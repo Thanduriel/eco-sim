@@ -1,5 +1,10 @@
 use bevy::{
-    asset::RenderAssetUsages, mesh::Indices, prelude::*, render::render_resource::PrimitiveTopology,
+    asset::RenderAssetUsages,
+    mesh::Indices,
+    pbr::{ExtendedMaterial, MaterialExtension},
+    prelude::*,
+    render::render_resource::{AsBindGroup, PrimitiveTopology},
+    shader::ShaderRef,
 };
 
 pub const MAX_AGE: f32 = 60.0;
@@ -8,11 +13,10 @@ pub const ORIENTATION_MAX_RADIUS: f32 = 0.1;
 pub const BELOW_SURFACE_DEPTH: f32 = 0.08;
 pub const SURFACE_AREA: f32 = 0.25;
 
-
 #[derive(Resource, Default)]
 pub struct GrassAssets {
     pub mesh: Handle<Mesh>,
-    pub material: Handle<StandardMaterial>,
+    pub material: Handle<GrassMaterial>,
 }
 
 pub fn create_grass_mesh(segments: usize, base_width: f32) -> Mesh {
@@ -41,9 +45,9 @@ pub fn create_grass_mesh(segments: usize, base_width: f32) -> Mesh {
     let normals = vec![[0.0, 0.0, 1.0]; num_vertices];
 
     // triangles
-    let mut triangles = Vec::with_capacity((num_vertices - 2) * 3 );
+    let mut triangles = Vec::with_capacity((num_vertices - 2) * 3);
     let top_idx = (num_vertices - 1) as u32;
-    for i in (0..top_idx-3).step_by(2) {
+    for i in (0..top_idx - 3).step_by(2) {
         triangles.extend([i, i + 1, i + 2]);
         triangles.extend([i + 2, i + 1, i + 3]);
     }
@@ -60,15 +64,38 @@ pub fn create_grass_mesh(segments: usize, base_width: f32) -> Mesh {
     .with_inserted_indices(Indices::U32(triangles))
 }
 
-pub fn create_grass_material() -> StandardMaterial {
-    StandardMaterial {
-        base_color: Color::linear_rgb(0.0, 1.0, 0.0),
-        alpha_mode: AlphaMode::Opaque,
-        double_sided: true,
-        perceptual_roughness: 0.6,
-        reflectance: 0.8,
-        cull_mode: None,
-        ..default()
+const SHADER_ASSET_PATH: &str = "shaders/grass.wgsl";
+
+#[derive(AsBindGroup, Asset, TypePath, Default, Debug, Clone)]
+pub struct GrassMaterialExtension {}
+
+impl MaterialExtension for GrassMaterialExtension {
+    fn vertex_shader() -> ShaderRef {
+        SHADER_ASSET_PATH.into()
+    }
+
+   /* fn deferred_vertex_shader() -> ShaderRef {
+        SHADER_ASSET_PATH.into()
+    }*/
+
+       fn prepass_vertex_shader() -> ShaderRef {
+        SHADER_ASSET_PATH.into()
     }
 }
 
+pub type GrassMaterial = ExtendedMaterial<StandardMaterial, GrassMaterialExtension>;
+
+pub fn create_grass_material() -> GrassMaterial {
+    ExtendedMaterial {
+        base: StandardMaterial {
+            base_color: Color::linear_rgb(0.0, 1.0, 0.0),
+            alpha_mode: AlphaMode::Opaque,
+            double_sided: true,
+            perceptual_roughness: 0.6,
+            reflectance: 0.8,
+            cull_mode: None,
+            ..default()
+        },
+        extension: GrassMaterialExtension {},
+    }
+}

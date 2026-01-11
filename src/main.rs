@@ -11,11 +11,11 @@ use crate::grass::{GrassAssets, create_grass_material, create_grass_mesh};
 use crate::terrain::*;
 
 mod camera_controller;
-mod player_inputs;
 mod color_map;
 mod domain;
 mod grass;
 mod organism;
+mod player_inputs;
 mod terrain;
 
 fn main() {
@@ -24,12 +24,17 @@ fn main() {
             brightness: 250.,
             ..default()
         })
-        .insert_resource(grass::GrassAssets::default())
-        .insert_resource(Time::<Fixed>::from_hz(60.0))
-        .insert_resource(player_inputs::FieldVisState::default())
         .add_plugins(DefaultPlugins)
         .add_plugins(CameraControllerPlugin)
         .add_plugins(EntropyPlugin::<WyRand>::default())
+        .insert_resource(grass::GrassAssets::default())
+        .add_plugins(MaterialPlugin::<grass::GrassMaterial> {
+            prepass_enabled: false,
+            shadows_enabled: true,
+            ..Default::default()
+        })
+        .insert_resource(Time::<Fixed>::from_hz(60.0))
+        .insert_resource(player_inputs::FieldVisState::default())
         //      .add_plugins(ScreenSpaceAmbientOcclusionPlugin)
         .add_systems(Startup, setup)
         .add_systems(Update, player_inputs::input_system)
@@ -51,10 +56,11 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ext_materials: ResMut<Assets<grass::GrassMaterial>>,
     mut grass_assets: ResMut<grass::GrassAssets>,
 ) {
     grass_assets.mesh = meshes.add(create_grass_mesh(4, 0.15));
-    grass_assets.material = materials.add(create_grass_material());
+    grass_assets.material = ext_materials.add(create_grass_material());
     // circular base
     commands.spawn((
         Mesh3d(meshes.add(Circle::new(4.0))),
