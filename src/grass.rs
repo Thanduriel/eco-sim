@@ -9,7 +9,7 @@ use bevy::{
 
 pub const MAX_AGE: f32 = 60.0;
 pub const SPAWN_RADIUS: f32 = 1.0;
-pub const ORIENTATION_MAX_RADIUS: f32 = 0.1;
+pub const ORIENTATION_MAX_RADIUS: f32 = 0.2;
 pub const BELOW_SURFACE_DEPTH: f32 = 0.08;
 pub const SURFACE_AREA: f32 = 0.25;
 
