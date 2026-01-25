@@ -74,7 +74,13 @@ pub fn reset_terrain_color(mesh: &mut Mesh) {
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, color_attr);
 }
 
-pub fn set_terrain_color(mesh: &mut Mesh, color_values: &domain::Field<f32>) {
+// Set the color at each vertex to the one in color_values.
+// If no range is provided, min and max values of the field are used.
+pub fn set_terrain_color(
+    mesh: &mut Mesh,
+    color_values: &domain::Field<f32>,
+    range: Option<(f32, f32)>,
+) {
     let mut color_attr = mesh.remove_attribute(Mesh::ATTRIBUTE_COLOR).unwrap();
     let VertexAttributeValues::Float32x4(ref mut col_attr_vec) = color_attr else {
         panic!("Unexpected vertex format, expected Float32x4");
@@ -85,7 +91,11 @@ pub fn set_terrain_color(mesh: &mut Mesh, color_values: &domain::Field<f32>) {
         panic!("Unexpected vertex format, expected Float32x3");
     };
 
-    let (min, max) = color_values.compute_min_max();
+    let (min, max) = if let Some(min_max) = range {
+        min_max
+    } else {
+        color_values.compute_min_max()
+    };
     let cmap = color_map::ColorMap::new(min, max, color_map::ColorScheme::Incandescent);
 
     for (pos, col) in pos_attr_vec.iter().zip(col_attr_vec.iter_mut()) {
@@ -95,16 +105,14 @@ pub fn set_terrain_color(mesh: &mut Mesh, color_values: &domain::Field<f32>) {
         );
 
         *col = cmap
-            .get_color(color_values.get_nearest(pos_domain))
+            .get_color(color_values.get_bilinear(pos_domain))
             .to_f32_array();
     }
 
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, color_attr);
 }
 
-pub fn generate_terrain_mesh(
-    height_map: &domain::Field<f32>,
-) -> Mesh {
+pub fn generate_terrain_mesh(height_map: &domain::Field<f32>) -> Mesh {
     let num_vertices: usize = (height_map.size.x + 2) * (height_map.size.y + 2);
     //let mut uvs: Vec<[f32;2]> = Vec::with_capacity(num_vertices);
     let mut vertex_colors: Vec<[f32; 4]> = Vec::with_capacity(num_vertices);
@@ -125,7 +133,7 @@ pub fn generate_terrain_mesh(
             pos[0] + domain::HALF_SIZE.x as f32,
             pos[2] + domain::HALF_SIZE.y as f32,
         );
-        let h = height_map.get_nearest(pos_domain);
+        let h = height_map.get_bilinear(pos_domain);
         pos[1] = h;
 
         vertex_colors.push(get_terrain_color(h).to_linear().to_f32_array());
