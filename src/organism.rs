@@ -1,11 +1,11 @@
 use crate::domain;
+use crate::grass;
 use crate::{Surface, Terrain};
 use bevy::prelude::*;
 use bevy_prng::WyRand;
 use bevy_rand::prelude::*;
 use rand::prelude::*;
 use std::f32::consts::PI;
-use crate::grass;
 
 #[derive(Component, Default)]
 pub struct Organism {
@@ -68,9 +68,9 @@ pub fn propagate_organisms(
             continue;
         }
 
-        let axis_circle = Circle::new(grass::ORIENTATION_MAX_RADIUS);
+        /*    let axis_circle = Circle::new(grass::ORIENTATION_MAX_RADIUS);
         let tip = axis_circle.sample_interior(&mut rng);
-        let axis = Vec3::new(tip.x, 1.0, tip.y).normalize();
+        let axis = Vec3::new(tip.x, 1.0, tip.y).normalize();*/
 
         commands.spawn((
             Mesh3d(grass_assets.mesh.clone()),
@@ -82,7 +82,13 @@ pub fn propagate_organisms(
                 p.y,
             ))
             .with_scale(Vec3::ZERO)
-            .with_rotation(Quat::from_axis_angle(axis, rng.random::<f32>() * 2.0 * PI)),
+            .with_rotation(Quat::from_euler(
+                EulerRot::XYZEx,
+                (rng.random::<f32>() - 0.5) * PI * grass::ORIENTATION_MAX_ANGLE,
+                rng.random::<f32>() * 2.0 * PI,
+                0.0
+            )),
+            //    .with_rotation(Quat::from_axis_angle(axis, rng.random::<f32>() * 2.0 * PI)),
             Organism::default(),
         ));
 
