@@ -1,8 +1,8 @@
 use bevy::prelude::*;
-use std::f32::consts::PI;
 use bevy_prng::WyRand;
-use rand::prelude::*;
 use bevy_rand::prelude::*;
+use rand::prelude::*;
+use std::f32::consts::PI;
 
 use crate::grass;
 use crate::organism;
@@ -39,13 +39,20 @@ pub fn vis_fields_system(
         return;
     }
 
+    //let now = std::time::Instant::now();
     let (mesh3d, surface) = terrain_query.single().unwrap();
     if let Some(mut mesh) = meshes.get_mut(&mesh3d.0) {
         match field_vis_state.field_type {
             FieldType::None => panic!(),
-            FieldType::Reset => reset_terrain_color(&mut mesh),
-            FieldType::VegDensity => set_terrain_color(&mut mesh, &surface.veg_density),
+            FieldType::Reset => {
+                reset_terrain_color(&mut mesh);
+                field_vis_state.field_type = FieldType::None
+            }
+            FieldType::VegDensity => {
+                set_terrain_color(&mut mesh, &surface.veg_density, Some((0.0, 1.0)))
+            }
         };
+    //    println!("{}", now.elapsed().as_secs_f64());
     }
 }
 

@@ -1,7 +1,7 @@
-use bevy::math::{FloatPow, USizeVec2};
+use bevy::math::{FloatPow, USizeVec2, usizevec2};
 use bevy::prelude::*;
 use num_traits::{Bounded, NumAssign};
-use std::ops::{Index, IndexMut, Mul};
+use std::ops::{Add, Index, IndexMut, Mul};
 
 const SIZE_POW: USizeVec2 = USizeVec2 { x: 6, y: 6 };
 pub const SIZE: USizeVec2 = USizeVec2 {
@@ -59,9 +59,30 @@ impl<T: Default + Copy + NumAssign> Field<T> {
         idx[0] + idx[1] * self.size.x
     }*/
 
+    #[allow(dead_code)]
     pub fn get_nearest(&self, pos: Vec2) -> T {
         let idx = self.clamp_index((pos * self.idx_scale).round().as_usizevec2());
         self.buffer[self.flat_index(idx)]
+    }
+}
+
+impl<T: Default + Copy + NumAssign + Mul<f32, Output = T> + Add<T, Output = T>> Field<T> {
+    pub fn get_bilinear(&self, pos: Vec2) -> T {
+        let pos_scaled = pos * self.idx_scale;
+        let t = pos_scaled.fract();
+        let lower_idx = self.clamp_index(pos_scaled.floor().as_usizevec2());
+        let upper_idx = self.clamp_index(pos_scaled.ceil().as_usizevec2());
+        let v00 = self.buffer[self.flat_index(lower_idx)];
+        let v10 = self.buffer[self.flat_index(usizevec2(upper_idx.x, lower_idx.y))];
+        let v01 = self.buffer[self.flat_index(usizevec2(lower_idx.x, upper_idx.y))];
+        let v11 = self.buffer[self.flat_index(upper_idx)];
+
+        // interpolate along x
+        let v0 = v00 * (1.0 - t.x) + v10 * t.x;
+        let v1 = v01 * (1.0 - t.x) + v11 * t.x;
+
+        // interpolate along y
+        return v0 * (1.0 - t.y) + v1 * t.y;
     }
 }
 

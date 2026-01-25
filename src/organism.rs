@@ -64,7 +64,7 @@ pub fn propagate_organisms(
         if !domain::BOUNDS.contains(p) {
             continue;
         }
-        if surface.veg_density.get_nearest(p) > 0.5 {
+        if surface.veg_density.get_bilinear(p) > 0.5 {
             continue;
         }
 
@@ -78,7 +78,7 @@ pub fn propagate_organisms(
             MeshMaterial3d(grass_assets.material.clone()),
             Transform::from_translation(Vec3::new(
                 p.x,
-                terrain.height_map.get_nearest(p) - grass::BELOW_SURFACE_DEPTH,
+                terrain.height_map.get_bilinear(p) - grass::BELOW_SURFACE_DEPTH,
                 p.y,
             ))
             .with_scale(Vec3::ZERO)
