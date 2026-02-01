@@ -14,6 +14,7 @@ mod camera_controller;
 mod color_map;
 mod domain;
 mod grass;
+mod hud;
 mod organism;
 mod player_inputs;
 mod terrain;
@@ -37,10 +38,12 @@ fn main() {
         .insert_resource(player_inputs::FieldVisState::default())
         //      .add_plugins(ScreenSpaceAmbientOcclusionPlugin)
         .add_systems(Startup, setup)
-        .add_systems(Update, player_inputs::input_system)
+        .add_systems(Update, player_inputs::picking_system)
         .add_systems(Update, player_inputs::vis_fields_system)
-        .add_systems(FixedUpdate, organism::update_organisms)
-        .add_systems(FixedUpdate, organism::propagate_organisms)
+        .add_systems(Update, hud::hud_system)
+        .add_systems(Update, player_inputs::general_actions_system)
+        .add_systems(FixedUpdate, organism::update_organisms_system)
+        .add_systems(FixedUpdate, organism::propagate_organisms_system)
         .run();
 }
 /*
@@ -129,6 +132,18 @@ fn setup(
         bevy::pbr::ScreenSpaceAmbientOcclusion {
             quality_level: bevy::pbr::ScreenSpaceAmbientOcclusionQualityLevel::High,
             constant_object_thickness: 4.0,
+        },
+    ));
+
+    // game speed indicator
+    commands.spawn((
+        Text::new("game speed: 0.0"),
+        TextLayout::new_with_justify(Justify::Right),
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(5),
+            left: px(5),
+            ..default()
         },
     ));
 }

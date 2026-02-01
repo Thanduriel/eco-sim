@@ -14,7 +14,7 @@ pub struct Organism {
 
 const MAX_SIZE: f32 = 1.0;
 
-pub fn update_organisms(
+pub fn update_organisms_system(
     time: Res<Time>,
     mut commands: Commands,
     mut surface_query: Query<&mut Surface>,
@@ -39,7 +39,7 @@ pub fn update_organisms(
 const SPAWN_PROP: f32 = 0.01;
 const MIN_PROPAGATION_AGE: f32 = 2.0;
 
-pub fn propagate_organisms(
+pub fn propagate_organisms_system(
     //    time: Res<Time>,
     mut commands: Commands,
     organism_query: Query<(&Transform, &Organism)>,
@@ -86,7 +86,7 @@ pub fn propagate_organisms(
                 EulerRot::XYZEx,
                 (rng.random::<f32>() - 0.5) * PI * grass::ORIENTATION_MAX_ANGLE,
                 rng.random::<f32>() * 2.0 * PI,
-                0.0
+                0.0,
             )),
             //    .with_rotation(Quat::from_axis_angle(axis, rng.random::<f32>() * 2.0 * PI)),
             Organism::default(),

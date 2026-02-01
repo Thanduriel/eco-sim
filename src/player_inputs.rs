@@ -52,11 +52,11 @@ pub fn vis_fields_system(
                 set_terrain_color(&mut mesh, &surface.veg_density, Some((0.0, 1.0)))
             }
         };
-    //    println!("{}", now.elapsed().as_secs_f64());
+        //    println!("{}", now.elapsed().as_secs_f64());
     }
 }
 
-pub fn input_system(
+pub fn picking_system(
     mut commands: Commands,
     grass_assets: Res<grass::GrassAssets>,
     mut ray_cast: MeshRayCast,
@@ -113,5 +113,17 @@ pub fn input_system(
                 )),
             organism::Organism::default(),
         ));
+    }
+}
+
+pub fn general_actions_system(
+    key_input: Res<ButtonInput<KeyCode>>,
+    mut time: ResMut<Time<Virtual>>,
+) {
+    let relative_speed = time.relative_speed();
+    if key_input.just_pressed(KeyCode::ArrowUp) {
+        time.set_relative_speed(relative_speed * 2.0);
+    } else if key_input.just_pressed(KeyCode::ArrowDown) {
+        time.set_relative_speed(relative_speed * 0.5);
     }
 }
