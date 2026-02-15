@@ -1,5 +1,5 @@
 use crate::domain;
-use crate::grass;
+use crate::parameters;
 use crate::{Surface, Terrain};
 use bevy::prelude::*;
 use bevy_prng::WyRand;
@@ -19,6 +19,7 @@ pub fn update_organisms_system(
     mut commands: Commands,
     mut surface_query: Query<&mut Surface>,
     mut organism_query: Query<(Entity, &mut Transform, &mut Organism)>,
+    general_params: Res<parameters::GeneralParameters>,
 ) {
     let mut surface = surface_query.single_mut().unwrap();
 
@@ -27,9 +28,11 @@ pub fn update_organisms_system(
         transform.scale = Vec3::ONE * organism.age.min(MAX_SIZE);
 
         // death
-        if organism.age > grass::MAX_AGE {
+        if organism.age > general_params.grass.max_age {
             let p = transform.translation.xz();
-            surface.veg_density.add_kernel(p, grass::SURFACE_AREA, -1.0);
+            surface
+                .veg_density
+                .add_kernel(p, general_params.grass.surface_area, -1.0);
             // delete entity
             commands.entity(id).despawn();
         }
@@ -47,6 +50,7 @@ pub fn propagate_organisms_system(
     mut surface_query: Query<&mut Surface>,
     mut rng: Single<&mut WyRand, With<GlobalRng>>,
     grass_assets: Res<crate::GrassAssets>,
+    general_params: Res<parameters::GeneralParameters>,
 ) {
     let terrain = terrain_query.single().unwrap();
     let mut surface = surface_query.single_mut().unwrap();
@@ -59,7 +63,7 @@ pub fn propagate_organisms_system(
             continue;
         }
 
-        let area = Circle::new(grass::SPAWN_RADIUS);
+        let area = Circle::new(general_params.grass.spawn_radius);
         let p = area.sample_interior(&mut rng) + transform.translation.xz();
         if !domain::BOUNDS.contains(p) {
             continue;
@@ -78,13 +82,13 @@ pub fn propagate_organisms_system(
             MeshMaterial3d(grass_assets.material.clone()),
             Transform::from_translation(Vec3::new(
                 p.x,
-                terrain.height_map.get_bilinear(p) - grass::BELOW_SURFACE_DEPTH,
+                terrain.height_map.get_bilinear(p) - general_params.grass.below_surface_depth,
                 p.y,
             ))
             .with_scale(Vec3::ZERO)
             .with_rotation(Quat::from_euler(
                 EulerRot::XYZEx,
-                (rng.random::<f32>() - 0.5) * PI * grass::ORIENTATION_MAX_ANGLE,
+                (rng.random::<f32>() - 0.5) * PI * general_params.grass.orientation_max_angle,
                 rng.random::<f32>() * 2.0 * PI,
                 0.0,
             )),
@@ -93,6 +97,8 @@ pub fn propagate_organisms_system(
         ));
 
         // add surface space usage
-        surface.veg_density.add_kernel(p, grass::SURFACE_AREA, 1.0);
+        surface
+            .veg_density
+            .add_kernel(p, general_params.grass.surface_area, 1.0);
     }
 }

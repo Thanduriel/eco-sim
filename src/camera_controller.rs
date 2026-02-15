@@ -10,6 +10,7 @@ use bevy::{
     prelude::*,
     window::{CursorGrabMode, CursorOptions},
 };
+use bevy_egui::input::{egui_wants_any_keyboard_input, egui_wants_any_pointer_input};
 use std::{f32::consts::*, fmt};
 
 /// A freecam-style camera controller plugin.
@@ -17,7 +18,11 @@ pub struct CameraControllerPlugin;
 
 impl Plugin for CameraControllerPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, run_camera_controller);
+        app.add_systems(
+            Update,
+            run_camera_controller
+                .run_if(not(egui_wants_any_keyboard_input).and(not(egui_wants_any_pointer_input))),
+        );
     }
 }
 

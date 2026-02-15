@@ -6,6 +6,11 @@ use bevy_prng::WyRand;
 use bevy_rand::prelude::*;
 use std::f32::consts::PI;
 
+use bevy_egui::{
+    EguiPlugin, EguiPrimaryContextPass,
+    input::{egui_wants_any_keyboard_input, egui_wants_any_pointer_input},
+};
+
 use crate::camera_controller::*;
 use crate::grass::{GrassAssets, create_grass_material, create_grass_mesh};
 use crate::terrain::*;
@@ -16,6 +21,7 @@ mod domain;
 mod grass;
 mod hud;
 mod organism;
+mod parameters;
 mod player_inputs;
 mod terrain;
 
@@ -26,6 +32,7 @@ fn main() {
             ..default()
         })
         .add_plugins(DefaultPlugins)
+        .add_plugins(EguiPlugin::default())
         .add_plugins(CameraControllerPlugin)
         .add_plugins(EntropyPlugin::<WyRand>::default())
         .insert_resource(grass::GrassAssets::default())
@@ -36,9 +43,15 @@ fn main() {
         })
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(player_inputs::FieldVisState::default())
+        .insert_resource(parameters::GeneralParameters::default())
+        .add_systems(EguiPrimaryContextPass, parameters::parameter_ui_system)
         //      .add_plugins(ScreenSpaceAmbientOcclusionPlugin)
         .add_systems(Startup, setup)
-        .add_systems(Update, player_inputs::picking_system)
+        .add_systems(
+            Update,
+            player_inputs::picking_system
+                .run_if(not(egui_wants_any_keyboard_input).and(not(egui_wants_any_pointer_input))),
+        )
         .add_systems(Update, player_inputs::vis_fields_system)
         .add_systems(Update, hud::hud_system)
         .add_systems(Update, player_inputs::general_actions_system)

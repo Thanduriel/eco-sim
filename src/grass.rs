@@ -7,11 +7,26 @@ use bevy::{
     shader::ShaderRef,
 };
 
-pub const MAX_AGE: f32 = 60.0;
-pub const SPAWN_RADIUS: f32 = 1.0;
-pub const ORIENTATION_MAX_ANGLE: f32 = 0.25;
-pub const BELOW_SURFACE_DEPTH: f32 = 0.08;
-pub const SURFACE_AREA: f32 = 0.25;
+#[derive(Resource, egui_probe::EguiProbe)]
+pub struct GrassParameters {
+    pub max_age: f32,
+    pub spawn_radius: f32,
+    pub orientation_max_angle: f32,
+    pub below_surface_depth: f32,
+    pub surface_area: f32,
+}
+
+impl Default for GrassParameters {
+    fn default() -> Self {
+        GrassParameters {
+            max_age: 60.0,
+            spawn_radius: 1.0,
+            orientation_max_angle: 0.25,
+            below_surface_depth: 0.08,
+            surface_area: 0.25,
+        }
+    }
+}
 
 #[derive(Resource, Default)]
 pub struct GrassAssets {
@@ -74,11 +89,11 @@ impl MaterialExtension for GrassMaterialExtension {
         SHADER_ASSET_PATH.into()
     }
 
-   /* fn deferred_vertex_shader() -> ShaderRef {
+    /* fn deferred_vertex_shader() -> ShaderRef {
         SHADER_ASSET_PATH.into()
     }*/
 
-       fn prepass_vertex_shader() -> ShaderRef {
+    fn prepass_vertex_shader() -> ShaderRef {
         SHADER_ASSET_PATH.into()
     }
 }
