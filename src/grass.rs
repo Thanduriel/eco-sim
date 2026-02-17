@@ -96,6 +96,14 @@ impl MaterialExtension for GrassMaterialExtension {
     fn prepass_vertex_shader() -> ShaderRef {
         SHADER_ASSET_PATH.into()
     }
+
+    fn enable_prepass() -> bool {
+        true
+    }
+
+    fn enable_shadows() -> bool {
+        true
+    }
 }
 
 pub type GrassMaterial = ExtendedMaterial<StandardMaterial, GrassMaterialExtension>;

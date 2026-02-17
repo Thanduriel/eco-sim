@@ -6,8 +6,20 @@ use egui_probe::{EguiProbe, Probe};
 
 use crate::grass;
 
+#[derive(EguiProbe)]
+pub struct SunParameters {
+    pub day_duration: f32
+}
+
+impl Default for SunParameters {
+    fn default() -> Self {
+        SunParameters {day_duration : 120.0 }
+    }
+}
+
 #[derive(Resource, EguiProbe, Default)]
 pub struct GeneralParameters {
+    pub sun : SunParameters,
     pub grass: grass::GrassParameters,
 }
 

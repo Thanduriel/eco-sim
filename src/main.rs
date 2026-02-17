@@ -1,5 +1,8 @@
-use bevy::light::CascadeShadowConfigBuilder;
+use bevy::camera;
+use bevy::light;
 use bevy::math::f32;
+use bevy::pbr;
+use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::render_resource::Face;
 use bevy_prng::WyRand;
@@ -27,26 +30,20 @@ mod terrain;
 
 fn main() {
     App::new()
-        .insert_resource(AmbientLight {
-            brightness: 250.,
-            ..default()
-        })
+        .insert_resource(GlobalAmbientLight::NONE)
         .add_plugins(DefaultPlugins)
         .add_plugins(EguiPlugin::default())
         .add_plugins(CameraControllerPlugin)
         .add_plugins(EntropyPlugin::<WyRand>::default())
         .insert_resource(grass::GrassAssets::default())
-        .add_plugins(MaterialPlugin::<grass::GrassMaterial> {
-            prepass_enabled: false,
-            shadows_enabled: true,
-            ..Default::default()
-        })
+        .add_plugins(MaterialPlugin::<grass::GrassMaterial>::default())
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(player_inputs::FieldVisState::default())
         .insert_resource(parameters::GeneralParameters::default())
         .add_systems(EguiPrimaryContextPass, parameters::parameter_ui_system)
         //      .add_plugins(ScreenSpaceAmbientOcclusionPlugin)
         .add_systems(Startup, setup)
+        .add_systems(Update, day_night_cycle)
         .add_systems(
             Update,
             player_inputs::picking_system
@@ -74,6 +71,7 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut ext_materials: ResMut<Assets<grass::GrassMaterial>>,
     mut grass_assets: ResMut<grass::GrassAssets>,
+    mut scattering_mediums: ResMut<Assets<pbr::ScatteringMedium>>,
 ) {
     grass_assets.mesh = meshes.add(create_grass_mesh(4, 0.15));
     grass_assets.material = ext_materials.add(create_grass_material());
@@ -124,16 +122,17 @@ fn setup(
     // sun
     commands.spawn((
         DirectionalLight {
-            illuminance: light_consts::lux::OVERCAST_DAY,
-            shadows_enabled: false,
+            illuminance: light_consts::lux::RAW_SUNLIGHT,
+            shadows_enabled: true,
             ..default()
         },
+        light::VolumetricLight,
         Transform {
             translation: Vec3::new(0.0, 0.0, 0.0),
             rotation: Quat::from_rotation_x(-PI / 4.),
             ..default()
         },
-        CascadeShadowConfigBuilder { ..default() }.build(),
+        light::CascadeShadowConfigBuilder { ..default() }.build(),
     ));
 
     // camera
@@ -142,10 +141,36 @@ fn setup(
         Transform::from_xyz(-2.5, 4.5, 9.0).looking_at(Vec3::ZERO, Vec3::Y),
         CameraController::default(),
         Msaa::Off,
-        bevy::pbr::ScreenSpaceAmbientOcclusion {
-            quality_level: bevy::pbr::ScreenSpaceAmbientOcclusionQualityLevel::High,
+        pbr::ScreenSpaceAmbientOcclusion {
+            quality_level: pbr::ScreenSpaceAmbientOcclusionQualityLevel::High,
             constant_object_thickness: 4.0,
         },
+        // Earthlike atmosphere
+        pbr::Atmosphere::earthlike(scattering_mediums.add(pbr::ScatteringMedium::default())),
+        // Can be adjusted to change the scene scale and rendering quality
+        pbr::AtmosphereSettings::default(),
+        // The directional light illuminance used in this scene
+        // (the one recommended for use with this feature) is
+        // quite bright, so raising the exposure compensation helps
+        // bring the scene to a nicer brightness range.
+        camera::Exposure { ev100: 13.0 },
+        // Tonemapper chosen just because it looked good with the scene, any
+        // tonemapper would be fine :)
+        // Tonemapping::AcesFitted,
+        // Bloom gives the sun a much more natural look.
+        Bloom::NATURAL,
+        // Enables the atmosphere to drive reflections and ambient lighting (IBL) for this view
+        light::AtmosphereEnvironmentMapLight::default(),
+        light::VolumetricFog {
+            ambient_intensity: 0.0,
+            ..default()
+        },
+    ));
+
+    // spawn the fog volume
+    commands.spawn((
+        light::FogVolume::default(),
+        Transform::from_scale(Vec3::new(10.0, 1.0, 10.0)).with_translation(Vec3::Y * 0.5),
     ));
 
     // game speed indicator
@@ -159,4 +184,15 @@ fn setup(
             ..default()
         },
     ));
+}
+
+
+
+fn day_night_cycle(
+    mut suns: Query<&mut Transform, With<DirectionalLight>>,
+    time: Res<Time>,
+    params: Res<parameters::GeneralParameters>,
+) {
+    suns.iter_mut()
+        .for_each(|mut tf| tf.rotate_x(-time.delta_secs() * 2.0 * PI / params.sun.day_duration));
 }
