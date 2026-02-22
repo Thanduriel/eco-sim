@@ -8,6 +8,10 @@ pub const SIZE: USizeVec2 = USizeVec2 {
     x: 1 << (SIZE_POW.x),
     y: 1 << (SIZE_POW.y),
 };
+pub const SIZE_F32: Vec2 = Vec2 {
+    x: SIZE.x as f32,
+    y: SIZE.y as f32,
+};
 pub const HALF_SIZE: USizeVec2 = USizeVec2 {
     x: SIZE.x >> 1,
     y: SIZE.y >> 1,

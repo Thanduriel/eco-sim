@@ -1,10 +1,8 @@
 use bevy::camera;
 use bevy::light;
-use bevy::math::f32;
 use bevy::pbr;
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
-use bevy::render::render_resource::Face;
 use bevy_prng::WyRand;
 use bevy_rand::prelude::*;
 use std::f32::consts::PI;
@@ -43,6 +41,7 @@ fn main() {
         .add_systems(EguiPrimaryContextPass, parameters::parameter_ui_system)
         //      .add_plugins(ScreenSpaceAmbientOcclusionPlugin)
         .add_systems(Startup, setup)
+        .add_systems(Startup, terrain::setup_terrain)
         .add_systems(Update, day_night_cycle)
         .add_systems(
             Update,
@@ -68,55 +67,21 @@ fn setup_world(world: &mut World){
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     mut ext_materials: ResMut<Assets<grass::GrassMaterial>>,
     mut grass_assets: ResMut<grass::GrassAssets>,
     mut scattering_mediums: ResMut<Assets<pbr::ScatteringMedium>>,
 ) {
     grass_assets.mesh = meshes.add(create_grass_mesh(4, 0.15));
     grass_assets.material = ext_materials.add(create_grass_material());
-    // circular base
-    commands.spawn((
-        Mesh3d(meshes.add(Circle::new(4.0))),
-        MeshMaterial3d(materials.add(Color::WHITE)),
-        Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
-    ));
-    // cube
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
-        MeshMaterial3d(materials.add(Color::srgb_u8(124, 144, 255))),
-        Transform::from_xyz(0.0, 0.5, 0.0),
-    ));
-
-    // terrain
-    let terrain_material = StandardMaterial {
-        //   alpha_mode: AlphaMode::Opaque,
-        double_sided: false,
-        perceptual_roughness: 1.0,
-        reflectance: 0.4,
-        cull_mode: Some(Face::Back),
-        //    flip_normal_map_y: true,
-        ..default()
-    };
-
-    let terrain = Terrain::new(3);
-    commands.spawn((
-        Mesh3d(meshes.add(generate_terrain_mesh(&terrain.height_map))),
-        MeshMaterial3d(materials.add(terrain_material)),
-        Transform::from_xyz(domain::HALF_SIZE.x as f32, 0.0, domain::HALF_SIZE.y as f32),
-        terrain,
-        Surface {
-            veg_density: domain::Field::new(3),
-        },
-    ));
 
     // point light
     commands.spawn((
         PointLight {
             shadows_enabled: true,
+
             ..default()
         },
-        Transform::from_xyz(4.0, 8.0, 4.0),
+        Transform::from_xyz(domain::HALF_SIZE.x as f32, 2.0, domain::HALF_SIZE.y as f32),
     ));
 
     // sun
@@ -138,7 +103,8 @@ fn setup(
     // camera
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(-2.5, 4.5, 9.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(domain::HALF_SIZE.x as f32, 4.5, domain::HALF_SIZE.y as f32)
+            .looking_at(Vec3::ZERO, Vec3::Y),
         CameraController::default(),
         Msaa::Off,
         pbr::ScreenSpaceAmbientOcclusion {
@@ -153,10 +119,8 @@ fn setup(
         // (the one recommended for use with this feature) is
         // quite bright, so raising the exposure compensation helps
         // bring the scene to a nicer brightness range.
-        camera::Exposure { ev100: 13.0 },
-        // Tonemapper chosen just because it looked good with the scene, any
-        // tonemapper would be fine :)
-        // Tonemapping::AcesFitted,
+        camera::Exposure { ev100: 14.0 },
+        bevy::core_pipeline::tonemapping::Tonemapping::None,
         // Bloom gives the sun a much more natural look.
         Bloom::NATURAL,
         // Enables the atmosphere to drive reflections and ambient lighting (IBL) for this view
@@ -168,10 +132,10 @@ fn setup(
     ));
 
     // spawn the fog volume
-    commands.spawn((
+    /*   commands.spawn((
         light::FogVolume::default(),
         Transform::from_scale(Vec3::new(10.0, 1.0, 10.0)).with_translation(Vec3::Y * 0.5),
-    ));
+    ));*/
 
     // game speed indicator
     commands.spawn((
@@ -185,8 +149,6 @@ fn setup(
         },
     ));
 }
-
-
 
 fn day_night_cycle(
     mut suns: Query<&mut Transform, With<DirectionalLight>>,

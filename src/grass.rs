@@ -111,11 +111,13 @@ pub type GrassMaterial = ExtendedMaterial<StandardMaterial, GrassMaterialExtensi
 pub fn create_grass_material() -> GrassMaterial {
     ExtendedMaterial {
         base: StandardMaterial {
-            base_color: Color::linear_rgb(0.0, 1.0, 0.0),
+            base_color: Color::srgb(0.357,0.400,0.224),
             alpha_mode: AlphaMode::Opaque,
             double_sided: true,
+            ior: 1.5,
             perceptual_roughness: 0.6,
-            reflectance: 0.8,
+            reflectance: 0.302,
+            diffuse_transmission : 0.25,
             cull_mode: None,
             ..default()
         },
