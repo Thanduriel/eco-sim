@@ -10,6 +10,7 @@ use std::f32::consts::PI;
 #[derive(Component, Default)]
 pub struct Organism {
     age: f32, // [s]
+    surface_area: f32,
 }
 
 const MAX_SIZE: f32 = 1.0;
@@ -24,15 +25,32 @@ pub fn update_organisms_system(
     let mut surface = surface_query.single_mut().unwrap();
 
     for (id, mut transform, mut organism) in organism_query.iter_mut() {
+        let dt = time.delta_secs();
+        // still growing
+        if organism.age < MAX_SIZE {
+            let delta = dt.min(1.0 - organism.age);
+            transform.scale = Vec3::ONE * (organism.age + delta);
+
+            // add surface area usage
+            let center = transform.translation.xz();
+            let delta_area = delta * general_params.grass.surface_area;
+            surface
+                .veg_density
+                .add_kernel(center, organism.surface_area, -1.0);
+            organism.surface_area += delta_area;
+            surface
+                .veg_density
+                .add_kernel(center, organism.surface_area, 1.0);
+        }
+
         organism.age += time.delta_secs();
-        transform.scale = Vec3::ONE * organism.age.min(MAX_SIZE);
 
         // death
         if organism.age > general_params.grass.max_age {
             let p = transform.translation.xz();
             surface
                 .veg_density
-                .add_kernel(p, general_params.grass.surface_area, -1.0);
+                .add_kernel(p, organism.surface_area, -1.0);
             // delete entity
             commands.entity(id).despawn();
         }
@@ -47,13 +65,13 @@ pub fn propagate_organisms_system(
     mut commands: Commands,
     organism_query: Query<(&Transform, &Organism)>,
     terrain_query: Query<&Terrain>,
-    mut surface_query: Query<&mut Surface>,
+    surface_query: Query<&Surface>,
     mut rng: Single<&mut WyRand, With<GlobalRng>>,
     grass_assets: Res<crate::GrassAssets>,
     general_params: Res<parameters::GeneralParameters>,
 ) {
     let terrain = terrain_query.single().unwrap();
-    let mut surface = surface_query.single_mut().unwrap();
+    let surface = surface_query.single().unwrap();
 
     for (transform, organism) in organism_query.iter() {
         if organism.age < MIN_PROPAGATION_AGE {
@@ -95,10 +113,5 @@ pub fn propagate_organisms_system(
             //    .with_rotation(Quat::from_axis_angle(axis, rng.random::<f32>() * 2.0 * PI)),
             Organism::default(),
         ));
-
-        // add surface space usage
-        surface
-            .veg_density
-            .add_kernel(p, general_params.grass.surface_area, 1.0);
     }
 }

@@ -51,7 +51,7 @@ pub fn vis_fields_system(
     }
 
     // update texture to visualize field
-    let now = std::time::Instant::now();
+    //let now = std::time::Instant::now();
     let surface = surface_query.single().unwrap();
     if let Some(mut img) = images.get_mut(&terrain_assets.field_vis_image) {
         match field_vis_state.field_type {
@@ -65,7 +65,7 @@ pub fn vis_fields_system(
         };
     }
 
-    println!("{}", now.elapsed().as_secs_f64());
+    //println!("{}", now.elapsed().as_secs_f64());
 }
 
 pub fn picking_system(
