@@ -68,6 +68,12 @@ impl<T: Default + Copy + NumAssign> Field<T> {
         let idx = self.clamp_index((pos * self.idx_scale).round().as_usizevec2());
         self.buffer[self.flat_index(idx)]
     }
+
+    // flat size
+    #[allow(dead_code)]
+    pub fn num_elem(&self) -> usize {
+        self.buffer.len()
+    }
 }
 
 impl<T: Default + Copy + NumAssign + Mul<f32, Output = T> + Add<T, Output = T>> Field<T> {
@@ -144,5 +150,19 @@ impl<T: Default + Copy + NumAssign> IndexMut<[usize; 2]> for Field<T> {
     fn index_mut(&mut self, index: [usize; 2]) -> &mut T {
         let flat_idx = self.flat_index(index.into());
         &mut self.buffer[flat_idx]
+    }
+}
+
+impl<T: Default + Copy + NumAssign> Index<usize> for Field<T> {
+    type Output = T;
+
+    fn index(&self, idx: usize) -> &T {
+        &self.buffer[idx]
+    }
+}
+
+impl<T: Default + Copy + NumAssign> IndexMut<usize> for Field<T> {
+    fn index_mut(&mut self, idx: usize) -> &mut T {
+        &mut self.buffer[idx]
     }
 }

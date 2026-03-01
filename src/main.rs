@@ -38,6 +38,7 @@ fn main() {
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(player_inputs::FieldVisState::default())
         .insert_resource(parameters::GeneralParameters::default())
+        .insert_resource(terrain::TerrainAssets::default())
         .add_systems(EguiPrimaryContextPass, parameters::parameter_ui_system)
         //      .add_plugins(ScreenSpaceAmbientOcclusionPlugin)
         .add_systems(Startup, setup)

@@ -8,11 +8,10 @@ use crate::grass;
 use crate::organism;
 use crate::terrain::*;
 
-#[derive(Default, PartialEq)]
+#[derive(Default, PartialEq, Copy, Clone)]
 enum FieldType {
     #[default]
     None,
-    Reset,
     VegDensity,
 }
 
@@ -22,38 +21,51 @@ pub struct FieldVisState {
 }
 
 pub fn vis_fields_system(
-    mut meshes: ResMut<Assets<Mesh>>,
-    terrain_query: Query<(&Mesh3d, &Surface), With<Terrain>>,
+    mut terrain_query: Query<&mut MeshMaterial3d<StandardMaterial>, With<Terrain>>,
+    surface_query: Query<&Surface>,
     key_input: Res<ButtonInput<KeyCode>>,
     mut field_vis_state: ResMut<FieldVisState>,
+    terrain_assets: Res<TerrainAssets>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // switch debug coloring
-    if key_input.pressed(KeyCode::F1) {
-        field_vis_state.field_type = FieldType::Reset;
-    }
-    if key_input.pressed(KeyCode::F2) {
+    // check user inputs
+    let prev_field_vis_type = field_vis_state.field_type;
+    if key_input.just_pressed(KeyCode::F1) {
+        field_vis_state.field_type = FieldType::None;
+    } else if key_input.just_pressed(KeyCode::F2) {
         field_vis_state.field_type = FieldType::VegDensity;
+    }
+
+    // update material
+    if prev_field_vis_type != field_vis_state.field_type {
+        let mut mat3d = terrain_query.single_mut().unwrap();
+        match field_vis_state.field_type {
+            FieldType::None => mat3d.0 = terrain_assets.ground_material.clone(),
+            FieldType::VegDensity => mat3d.0 = terrain_assets.field_vis_material.clone(),
+        }
     }
 
     if field_vis_state.field_type == FieldType::None {
         return;
     }
 
-    //let now = std::time::Instant::now();
-    let (mesh3d, surface) = terrain_query.single().unwrap();
-    if let Some(mut mesh) = meshes.get_mut(&mesh3d.0) {
+    // update texture to visualize field
+    let now = std::time::Instant::now();
+    let surface = surface_query.single().unwrap();
+    if let Some(mut img) = images.get_mut(&terrain_assets.field_vis_image) {
         match field_vis_state.field_type {
             FieldType::None => panic!(),
-            FieldType::Reset => {
-                reset_terrain_color(&mut mesh);
-                field_vis_state.field_type = FieldType::None
-            }
             FieldType::VegDensity => {
-                set_terrain_color(&mut mesh, &surface.veg_density, Some((0.0, 1.0)))
+                set_image_from_field(&mut img, &surface.veg_density, Some((0.0, 1.0)));
+                // fetch material to update the texture on device
+                _ = materials.get_mut(&terrain_assets.field_vis_material);
+                {}
             }
         };
-        //    println!("{}", now.elapsed().as_secs_f64());
     }
+
+    println!("{}", now.elapsed().as_secs_f64());
 }
 
 pub fn picking_system(
