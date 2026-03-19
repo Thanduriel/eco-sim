@@ -1,4 +1,5 @@
 use bevy::camera;
+use bevy::dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig};
 use bevy::light;
 use bevy::pbr;
 use bevy::post_process::bloom::Bloom;
@@ -33,6 +34,25 @@ fn main() {
         .add_plugins(EguiPlugin::default())
         .add_plugins(CameraControllerPlugin)
         .add_plugins(EntropyPlugin::<WyRand>::default())
+        .add_plugins(FpsOverlayPlugin {
+            config: FpsOverlayConfig {
+                text_config: TextFont {
+                    font_size: 24.0,
+                    ..Default::default()
+                },
+                // We can also set the refresh interval for the FPS counter
+                refresh_interval: core::time::Duration::from_millis(100),
+                enabled: true,
+                frame_time_graph_config: FrameTimeGraphConfig {
+                    enabled: true,
+                    // The minimum acceptable fps
+                    min_fps: 15.0,
+                    // The target fps
+                    target_fps: 60.0,
+                },
+                ..Default::default()
+            },
+        })
         .insert_resource(grass::GrassAssets::default())
         .add_plugins(MaterialPlugin::<grass::GrassMaterial>::default())
         .insert_resource(Time::<Fixed>::from_hz(60.0))
@@ -143,11 +163,13 @@ fn setup(
         Text::new("game speed: 0.0"),
         TextLayout::new_with_justify(Justify::Right),
         Node {
-            position_type: PositionType::Absolute,
-            top: px(5),
+            position_type: PositionType::Relative,
+            bottom: px(5),
             left: px(5),
+            align_self: AlignSelf::End,
             ..default()
         },
+        hud::GameSpeedLabel::default(),
     ));
 }
 
