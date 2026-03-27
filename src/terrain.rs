@@ -1,10 +1,10 @@
-use bevy::color::{Color, Mix};
-use bevy::prelude::*;
 use bevy::asset::RenderAssetUsages;
+use bevy::color::{Color, Mix};
 use bevy::image::{
     Image, ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor,
 };
 use bevy::mesh::VertexAttributeValues;
+use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
 use bevy::tasks::{ComputeTaskPool, ParallelSliceMut};
 
@@ -69,7 +69,6 @@ fn get_terrain_color(height: f32) -> Color {
     Color::linear_rgb(0.75, 0.75, 0.75).mix(&Color::WHITE, t)
 }
 
-/*
 pub fn reset_terrain_color(mesh: &mut Mesh) {
     let mut color_attr = mesh.remove_attribute(Mesh::ATTRIBUTE_COLOR).unwrap();
     let VertexAttributeValues::Float32x4(ref mut col_attr_vec) = color_attr else {
@@ -88,13 +87,9 @@ pub fn reset_terrain_color(mesh: &mut Mesh) {
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, color_attr);
 }
 
-// Set the color at each vertex to the one in color_values.
+// Set the color at each vertex to the one in field.
 // If no range is provided, min and max values of the field are used.
-pub fn set_terrain_color(
-    mesh: &mut Mesh,
-    color_values: &domain::Field<f32>,
-    range: Option<(f32, f32)>,
-) {
+pub fn set_terrain_color(mesh: &mut Mesh, field: &domain::Field<f32>, range: Option<(f32, f32)>) {
     let mut color_attr = mesh.remove_attribute(Mesh::ATTRIBUTE_COLOR).unwrap();
     let VertexAttributeValues::Float32x4(ref mut col_attr_vec) = color_attr else {
         panic!("Unexpected vertex format, expected Float32x4");
@@ -108,23 +103,31 @@ pub fn set_terrain_color(
     let (min, max) = if let Some(min_max) = range {
         min_max
     } else {
-        color_values.compute_min_max()
+        field.compute_min_max()
     };
     let cmap = color_map::ColorMap::new(min, max, color_map::ColorScheme::Incandescent);
 
-    for (pos, col) in pos_attr_vec.iter().zip(col_attr_vec.iter_mut()) {
-        let pos_domain = Vec2::new(
-            pos[0] + domain::HALF_SIZE.x as f32,
-            pos[2] + domain::HALF_SIZE.y as f32,
-        );
-
-        *col = cmap
-            .get_color(color_values.get_bilinear(pos_domain))
-            .to_f32_array();
-    }
+    let task_pool = ComputeTaskPool::get();
+    // Creating significantly more tasks than the available threads leads to more consistent timings.
+    // todo: investigate again when there is more simulation work
+    let chunk_size = 2048;
+    col_attr_vec.par_chunk_map_mut(task_pool, chunk_size, |index, chunk| {
+        let mut idx = index * chunk_size;
+        for col in chunk {
+            let pos = pos_attr_vec[idx];
+            let pos_domain = Vec2::new(
+                pos[0] + domain::HALF_SIZE.x as f32,
+                pos[2] + domain::HALF_SIZE.y as f32,
+            );
+            *col = cmap
+                .get_color(field.get_bilinear(pos_domain))
+                .to_f32_array();
+            idx += 1;
+        }
+    });
 
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, color_attr);
-}*/
+}
 
 pub fn generate_terrain_mesh(height_map: &domain::Field<f32>) -> Mesh {
     let num_vertices: usize = (height_map.size.x + 2) * (height_map.size.y + 2);
@@ -163,6 +166,7 @@ pub fn generate_terrain_mesh(height_map: &domain::Field<f32>) -> Mesh {
 
 // Sets the image to represent the field. The Image is resized if the sizes don't match.
 // If no range is provided, min and max values of the field are used.
+#[allow(dead_code)]
 pub fn set_image_from_field(
     image: &mut Image,
     field: &domain::Field<f32>,
@@ -267,10 +271,10 @@ pub fn setup_terrain(
             asset_server
                 .load_with_settings("textures/ground/PX_Soil_Ground_24_normal.jpg", disable_srgb),
         ),
-        metallic_roughness_texture: Some(asset_server.load_with_settings(
+        /*    metallic_roughness_texture: Some(asset_server.load_with_settings(
             "textures/ground/PX_Soil_Ground_24_roughness.jpg",
             disable_srgb,
-        )),
+        )),*/
         occlusion_texture: Some(
             asset_server
                 .load_with_settings("textures/ground/PX_Soil_Ground_24_ao.jpg", disable_srgb),
@@ -290,17 +294,19 @@ pub fn setup_terrain(
     let terrain = Terrain::new(3);
 
     // (debug) visualize fields
-    terrain_assets.field_vis_image = images.add(Image::new_fill(
+    let mut field_vis_image = Image::new_fill(
         Extent3d {
             width: terrain.height_map.size.x as u32,
             height: terrain.height_map.size.y as u32,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        &[0u8; 4],
+        &[255u8; 4],
         TextureFormat::Rgba8Unorm,
         RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
-    ));
+    );
+    field_vis_image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::nearest());
+    terrain_assets.field_vis_image = images.add(field_vis_image);
 
     let field_vis_material = StandardMaterial {
         base_color_texture: Some(terrain_assets.field_vis_image.clone()),
@@ -309,10 +315,6 @@ pub fn setup_terrain(
         ..default()
     };
     terrain_assets.field_vis_material = materials.add(field_vis_material);
-
-    if let Some(mut img) = images.get_mut(&terrain_assets.field_vis_image) {
-        set_image_from_field(&mut img, &terrain.height_map, None);
-    }
 
     commands.spawn((
         Mesh3d(meshes.add(generate_terrain_mesh(&terrain.height_map))),

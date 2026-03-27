@@ -21,13 +21,12 @@ pub struct FieldVisState {
 }
 
 pub fn vis_fields_system(
-    mut terrain_query: Query<&mut MeshMaterial3d<StandardMaterial>, With<Terrain>>,
+    mut terrain_query: Query<(&mut MeshMaterial3d<StandardMaterial>, &Mesh3d), With<Terrain>>,
     surface_query: Query<&Surface>,
     key_input: Res<ButtonInput<KeyCode>>,
     mut field_vis_state: ResMut<FieldVisState>,
     terrain_assets: Res<TerrainAssets>,
-    mut images: ResMut<Assets<Image>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
 ) {
     // check user inputs
     let prev_field_vis_type = field_vis_state.field_type;
@@ -37,12 +36,20 @@ pub fn vis_fields_system(
         field_vis_state.field_type = FieldType::VegDensity;
     }
 
+    let (mut mat3d, mesh3d) = terrain_query.single_mut().unwrap();
+
     // update material
     if prev_field_vis_type != field_vis_state.field_type {
-        let mut mat3d = terrain_query.single_mut().unwrap();
         match field_vis_state.field_type {
-            FieldType::None => mat3d.0 = terrain_assets.ground_material.clone(),
-            FieldType::VegDensity => mat3d.0 = terrain_assets.field_vis_material.clone(),
+            FieldType::None => {
+                mat3d.0 = terrain_assets.ground_material.clone();
+                if let Some(mesh) = meshes.get_mut(&mesh3d.0) {
+                    reset_terrain_color(mesh);
+                }
+            }
+            FieldType::VegDensity => {
+                mat3d.0 = terrain_assets.field_vis_material.clone();
+            }
         }
     }
 
@@ -50,17 +57,14 @@ pub fn vis_fields_system(
         return;
     }
 
-    // update texture to visualize field
+    // update vertex colors to visualize field
     //let now = std::time::Instant::now();
     let surface = surface_query.single().unwrap();
-    if let Some(mut img) = images.get_mut(&terrain_assets.field_vis_image) {
+    if let Some(mesh) = meshes.get_mut(&mesh3d.0) {
         match field_vis_state.field_type {
             FieldType::None => panic!(),
             FieldType::VegDensity => {
-                set_image_from_field(&mut img, &surface.veg_density, Some((0.0, 1.0)));
-                // fetch material to update the texture on device
-                _ = materials.get_mut(&terrain_assets.field_vis_material);
-                {}
+                set_terrain_color(mesh, &surface.veg_density, Some((0.0, 1.0)));
             }
         };
     }
