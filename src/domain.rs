@@ -122,8 +122,13 @@ impl<T: Default + Copy + NumAssign + Mul<f32, Output = T>> Field<T> {
         let r_local = radius * self.idx_scale;
         let min_pos_local = pos_local - Vec2::splat(r_local);
         let max_pos_local = pos_local + Vec2::splat(r_local);
-        let min_idx = self.clamp_index((min_pos_local).floor().as_usizevec2());
-        let max_idx = self.clamp_index((max_pos_local).ceil().as_usizevec2());
+        // +1 because the contribution at the min_idx is always 0
+        let min_idx = self.clamp_index(min_pos_local.ceil().as_usizevec2());
+        // upper bound is size (inclusive) because the loop is exclusive
+        let max_idx = max_pos_local
+            .ceil()
+            .as_usizevec2()
+            .clamp(USizeVec2::ZERO, self.size);
 
         let r_sq = r_local.squared();
         for iy in min_idx.y..max_idx.y {
