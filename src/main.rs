@@ -178,6 +178,9 @@ fn day_night_cycle(
     time: Res<Time>,
     params: Res<parameters::GeneralParameters>,
 ) {
-    suns.iter_mut()
-        .for_each(|mut tf| tf.rotate_x(-time.delta_secs() * 2.0 * PI / params.sun.day_duration));
+    if params.sun.is_moving {
+        suns.iter_mut().for_each(|mut tf| {
+            tf.rotate_x(-time.delta_secs() * 2.0 * PI / params.sun.day_duration)
+        });
+    }
 }

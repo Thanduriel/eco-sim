@@ -8,12 +8,13 @@ use crate::grass;
 
 #[derive(EguiProbe)]
 pub struct SunParameters {
-    pub day_duration: f32
+    pub day_duration: f32,
+    pub is_moving: bool,
 }
 
 impl Default for SunParameters {
     fn default() -> Self {
-        SunParameters {day_duration : 120.0 }
+        SunParameters { day_duration : 120.0, is_moving : false }
     }
 }
 
