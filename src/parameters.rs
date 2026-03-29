@@ -7,6 +7,21 @@ use egui_probe::{EguiProbe, Probe};
 use crate::grass;
 
 #[derive(EguiProbe)]
+pub struct GameSpeedParameters {
+    pub auto_slow_fps: f32,
+    pub min_speed: f32,
+    pub max_speed: f32,
+}
+
+pub const PHYSICS_TICKS_PER_SEC: f32 = 60.0;
+
+impl Default for GameSpeedParameters {
+    fn default() -> Self {
+        GameSpeedParameters { auto_slow_fps: 15.0, min_speed: 0.125, max_speed: 64.0 }
+    }
+}
+
+#[derive(EguiProbe)]
 pub struct SunParameters {
     pub day_duration: f32,
     pub is_moving: bool,
@@ -20,6 +35,7 @@ impl Default for SunParameters {
 
 #[derive(Resource, EguiProbe, Default)]
 pub struct GeneralParameters {
+    pub game_speed : GameSpeedParameters,
     pub sun : SunParameters,
     pub grass: grass::GrassParameters,
 }

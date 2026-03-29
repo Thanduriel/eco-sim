@@ -116,8 +116,8 @@ pub fn set_terrain_color(mesh: &mut Mesh, field: &domain::Field<f32>, range: Opt
         for col in chunk {
             let pos = pos_attr_vec[idx];
             let pos_domain = Vec2::new(
-                pos[0] + domain::HALF_SIZE.x as f32,
-                pos[2] + domain::HALF_SIZE.y as f32,
+                pos[0] + domain::CENTER.x,
+                pos[2] + domain::CENTER.y,
             );
             *col = cmap
                 .get_color(field.get_bilinear(pos_domain))
@@ -135,7 +135,7 @@ pub fn generate_terrain_mesh(height_map: &domain::Field<f32>) -> Mesh {
     let mut vertex_colors: Vec<[f32; 4]> = Vec::with_capacity(num_vertices);
     let mut mesh: Mesh = Plane3d::default()
         .mesh()
-        .size(domain::SIZE.x as f32, domain::SIZE.y as f32)
+        .size(domain::SIZE_F32.x, domain::SIZE_F32.y)
         .subdivisions((height_map.size.x - 1) as u32)
         .into();
     // get positions
@@ -147,8 +147,8 @@ pub fn generate_terrain_mesh(height_map: &domain::Field<f32>) -> Mesh {
     // modify y with height sampling
     for pos in pos_attr_vec.iter_mut() {
         let pos_domain = Vec2::new(
-            pos[0] + domain::HALF_SIZE.x as f32,
-            pos[2] + domain::HALF_SIZE.y as f32,
+            pos[0] + domain::CENTER.x,
+            pos[2] + domain::CENTER.y,
         );
         let h = height_map.get_bilinear(pos_domain);
         pos[1] = h;
@@ -319,7 +319,7 @@ pub fn setup_terrain(
     commands.spawn((
         Mesh3d(meshes.add(generate_terrain_mesh(&terrain.height_map))),
         MeshMaterial3d(terrain_assets.ground_material.clone()),
-        Transform::from_xyz(domain::HALF_SIZE.x as f32, 0.0, domain::HALF_SIZE.y as f32),
+        Transform::from_xyz(domain::CENTER.x, 0.0, domain::CENTER.y),
         terrain,
         Surface {
             veg_density: domain::Field::new(3),

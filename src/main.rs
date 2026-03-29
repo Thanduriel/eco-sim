@@ -55,12 +55,13 @@ fn main() {
         })
         .insert_resource(grass::GrassAssets::default())
         .add_plugins(MaterialPlugin::<grass::GrassMaterial>::default())
-        .insert_resource(Time::<Fixed>::from_hz(60.0))
+        .insert_resource(Time::<Fixed>::from_hz(
+            parameters::PHYSICS_TICKS_PER_SEC as f64,
+        ))
         .insert_resource(player_inputs::FieldVisState::default())
         .insert_resource(parameters::GeneralParameters::default())
         .insert_resource(terrain::TerrainAssets::default())
         .add_systems(EguiPrimaryContextPass, parameters::parameter_ui_system)
-        //      .add_plugins(ScreenSpaceAmbientOcclusionPlugin)
         .add_systems(Startup, setup)
         .add_systems(Startup, terrain::setup_terrain)
         .add_systems(Update, day_night_cycle)
@@ -76,13 +77,6 @@ fn main() {
         .add_systems(FixedUpdate, organism::propagate_organisms_system)
         .run();
 }
-/*
-fn setup_world(world: &mut World){
-    world.insert_resource(grass::GrassAssets {
-        mesh: Handle::,
-        material: materials.add(Color::linear_rgb(0.0, 1.0, 0.0)),
-    });
-}*/
 
 /// set scene
 fn setup(
@@ -102,7 +96,7 @@ fn setup(
 
             ..default()
         },
-        Transform::from_xyz(domain::HALF_SIZE.x as f32, 2.0, domain::HALF_SIZE.y as f32),
+        Transform::from_xyz(domain::CENTER.x, 2.0, domain::CENTER.y),
     ));
 
     // sun
@@ -124,7 +118,7 @@ fn setup(
     // camera
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(domain::HALF_SIZE.x as f32, 4.5, domain::HALF_SIZE.y as f32)
+        Transform::from_xyz(domain::CENTER.x, 4.5, domain::CENTER.y)
             .looking_at(Vec3::ZERO, Vec3::Y),
         CameraController::default(),
         Msaa::Off,

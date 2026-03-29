@@ -3,9 +3,11 @@ use bevy_prng::WyRand;
 use bevy_rand::prelude::*;
 use rand::prelude::*;
 use std::f32::consts::PI;
+use std::time::Duration;
 
 use crate::grass;
 use crate::organism;
+use crate::parameters;
 use crate::terrain::*;
 
 #[derive(Default, PartialEq, Copy, Clone)]
@@ -135,11 +137,33 @@ pub fn picking_system(
 pub fn general_actions_system(
     key_input: Res<ButtonInput<KeyCode>>,
     mut time: ResMut<Time<Virtual>>,
+    real_time: Res<Time<Real>>,
+    params: Res<parameters::GeneralParameters>,
+    mut frames_since_throttle: Local<i32>,
 ) {
     let relative_speed = time.relative_speed();
-    if key_input.just_pressed(KeyCode::ArrowUp) {
+
+    // Reduce speed if the update can't keep up.
+    // Wait a few steps in between for the framerate to stabilize.
+    *frames_since_throttle += 1;
+    if relative_speed > 1.0 && *frames_since_throttle > 8 {
+        if real_time.delta() >= Duration::from_secs_f32(1.0 / params.game_speed.auto_slow_fps) {
+            time.set_relative_speed(relative_speed * 0.5);
+            *frames_since_throttle = 0;
+            bevy::log::info!("Reducing game speed because the update can't keep up.");
+        }
+    }
+
+    time.set_max_delta(Duration::from_secs_f32(
+        params.game_speed.max_speed / parameters::PHYSICS_TICKS_PER_SEC,
+    ));
+
+    // user controls
+    if relative_speed > params.game_speed.min_speed && key_input.just_pressed(KeyCode::ArrowUp) {
         time.set_relative_speed(relative_speed * 2.0);
-    } else if key_input.just_pressed(KeyCode::ArrowDown) {
+    } else if relative_speed < params.game_speed.max_speed
+        && key_input.just_pressed(KeyCode::ArrowDown)
+    {
         time.set_relative_speed(relative_speed * 0.5);
     }
 }

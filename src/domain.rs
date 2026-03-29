@@ -3,20 +3,30 @@ use bevy::prelude::*;
 use num_traits::{Bounded, NumAssign};
 use std::ops::{Add, Index, IndexMut, Mul};
 
+// The world size is always a power of two to simplify interpolation between different resolution meshes.
 const SIZE_POW: USizeVec2 = USizeVec2 { x: 6, y: 6 };
+// fixed world size
 pub const SIZE: USizeVec2 = USizeVec2 {
     x: 1 << (SIZE_POW.x),
     y: 1 << (SIZE_POW.y),
 };
+// same size buf as float
 pub const SIZE_F32: Vec2 = Vec2 {
     x: SIZE.x as f32,
     y: SIZE.y as f32,
 };
+// center of the world
 pub const HALF_SIZE: USizeVec2 = USizeVec2 {
     x: SIZE.x >> 1,
     y: SIZE.y >> 1,
 };
+// center of the world as f32
+pub const CENTER: Vec2 = Vec2 {
+    x: HALF_SIZE.x as f32,
+    y: HALF_SIZE.y as f32,
+};
 
+// limits of the world as a rectangle
 pub const BOUNDS: Rect = Rect {
     min: Vec2 { x: 0.0, y: 0.0 },
     max: Vec2 {
@@ -25,18 +35,15 @@ pub const BOUNDS: Rect = Rect {
     },
 };
 
+// Generic field defined on the whole domain
 pub struct Field<T> {
     buffer: Vec<T>,
-    //    subdivisions: i32,
-    pub idx_scale: f32,
+    pub idx_scale: f32, // factor to go from world coordinates to internal coordinates
     pub size: USizeVec2,
 }
-/*
-trait FieldType:
-    Default + Copy + NumAssign {
-}*/
 
 impl<T: Default + Copy + NumAssign> Field<T> {
+    // @param subdivisions Number of subdivisions of the domain to get the resolution of this field. A negative number instead coarsens the grid.
     pub fn new(subdivisions: i32) -> Self {
         let size = USizeVec2::new(
             1 << (SIZE_POW.x as i32 + subdivisions) as usize,
@@ -122,7 +129,7 @@ impl<T: Default + Copy + NumAssign + Mul<f32, Output = T>> Field<T> {
         let r_local = radius * self.idx_scale;
         let min_pos_local = pos_local - Vec2::splat(r_local);
         let max_pos_local = pos_local + Vec2::splat(r_local);
-        // +1 because the contribution at the min_idx is always 0
+        // ceil instead of floor because the contribution at the min_idx is always 0
         let min_idx = self.clamp_index(min_pos_local.ceil().as_usizevec2());
         // upper bound is size (inclusive) because the loop is exclusive
         let max_idx = max_pos_local
