@@ -119,18 +119,18 @@ pub fn picking_system(
     let hits = ray_cast.cast_ray(ray, &settings);
 
     for (_, hit) in hits {
-        commands.spawn((
-            Mesh3d(grass_assets.mesh.clone()),
-            bevy::light::NotShadowCaster::default(),
-            MeshMaterial3d(grass_assets.material.clone()),
-            Transform::from_translation(hit.point - vec3(0.0, 0.1, 0.0))
+        commands.spawn(organism::OrganismBundle {
+            mesh: Mesh3d(grass_assets.mesh.clone()),
+            no_shadow: bevy::light::NotShadowCaster::default(),
+            material: MeshMaterial3d(grass_assets.material.clone()),
+            transform: Transform::from_translation(hit.point - vec3(0.0, 0.1, 0.0))
                 .with_scale(Vec3::ZERO)
                 .with_rotation(Quat::from_axis_angle(
                     Vec3::new(0.0, 1.0, 0.0),
                     rng.random::<f32>() * 2.0 * PI,
                 )),
-            organism::Organism::default(),
-        ));
+            organism: organism::Organism::default(),
+        });
     }
 }
 

@@ -1,4 +1,5 @@
 use crate::domain;
+use crate::grass;
 use crate::parameters;
 use crate::{Surface, Terrain};
 use bevy::prelude::*;
@@ -13,6 +14,15 @@ pub struct Organism {
     surface_area: f32,
 }
 
+#[derive(Bundle)]
+pub struct OrganismBundle {
+    pub mesh: Mesh3d,
+    pub no_shadow: bevy::light::NotShadowCaster,
+    pub material: MeshMaterial3d<grass::GrassMaterial>,
+    pub transform: Transform,
+    pub organism: Organism,
+}
+
 const MAX_SIZE: f32 = 1.0;
 
 pub fn update_organisms_system(
@@ -22,9 +32,12 @@ pub fn update_organisms_system(
     mut organism_query: Query<(Entity, &mut Transform, &mut Organism)>,
     general_params: Res<parameters::GeneralParameters>,
 ) {
+    //let now = std::time::Instant::now();
     let mut surface = surface_query.single_mut().unwrap();
 
+    //let mut count = 0;
     for (id, mut transform, mut organism) in organism_query.iter_mut() {
+        //count += 1;
         let dt = time.delta_secs();
         // still growing
         if organism.age < MAX_SIZE {
@@ -43,7 +56,7 @@ pub fn update_organisms_system(
                 .add_kernel(center, organism.surface_area, 1.0);
         }
 
-        organism.age += time.delta_secs();
+        organism.age += dt;
 
         // death
         if organism.age > general_params.grass.max_age {
@@ -55,13 +68,13 @@ pub fn update_organisms_system(
             commands.entity(id).despawn();
         }
     }
+    //println!("entities: {}, {}s", count, now.elapsed().as_secs_f64());
 }
 
 const SPAWN_PROP: f32 = 0.01;
 const MIN_PROPAGATION_AGE: f32 = 2.0;
 
 pub fn propagate_organisms_system(
-    //    time: Res<Time>,
     mut commands: Commands,
     organism_query: Query<(&Transform, &Organism)>,
     terrain_query: Query<&Terrain>,
@@ -70,8 +83,12 @@ pub fn propagate_organisms_system(
     grass_assets: Res<crate::GrassAssets>,
     general_params: Res<parameters::GeneralParameters>,
 ) {
+    //let now = std::time::Instant::now();
+
     let terrain = terrain_query.single().unwrap();
     let surface = surface_query.single().unwrap();
+
+    let mut new_organisms = Vec::<OrganismBundle>::new();
 
     for (transform, organism) in organism_query.iter() {
         if organism.age < MIN_PROPAGATION_AGE {
@@ -90,15 +107,29 @@ pub fn propagate_organisms_system(
             continue;
         }
 
-        /*    let axis_circle = Circle::new(grass::ORIENTATION_MAX_RADIUS);
-        let tip = axis_circle.sample_interior(&mut rng);
-        let axis = Vec3::new(tip.x, 1.0, tip.y).normalize();*/
-
-        commands.spawn((
-            Mesh3d(grass_assets.mesh.clone()),
-            bevy::light::NotShadowCaster::default(),
-            MeshMaterial3d(grass_assets.material.clone()),
-            Transform::from_translation(Vec3::new(
+        /*  commands.spawn((
+          Mesh3d(grass_assets.mesh.clone()),
+          bevy::light::NotShadowCaster::default(),
+          MeshMaterial3d(grass_assets.material.clone()),
+          Transform::from_translation(Vec3::new(
+              p.x,
+              terrain.height_map.get_bilinear(p) - general_params.grass.below_surface_depth,
+              p.y,
+          ))
+          .with_scale(Vec3::ZERO)
+          .with_rotation(Quat::from_euler(
+              EulerRot::XYZEx,
+              (rng.random::<f32>() - 0.5) * PI * general_params.grass.orientation_max_angle,
+              rng.random::<f32>() * 2.0 * PI,
+              0.0,
+          )),
+          Organism::default(),
+        ));*/
+        new_organisms.push(OrganismBundle {
+            mesh: Mesh3d(grass_assets.mesh.clone()),
+            no_shadow: bevy::light::NotShadowCaster::default(),
+            material: MeshMaterial3d(grass_assets.material.clone()),
+            transform: Transform::from_translation(Vec3::new(
                 p.x,
                 terrain.height_map.get_bilinear(p) - general_params.grass.below_surface_depth,
                 p.y,
@@ -110,8 +141,10 @@ pub fn propagate_organisms_system(
                 rng.random::<f32>() * 2.0 * PI,
                 0.0,
             )),
-            //    .with_rotation(Quat::from_axis_angle(axis, rng.random::<f32>() * 2.0 * PI)),
-            Organism::default(),
-        ));
+            organism: Organism::default(),
+        });
     }
+
+    commands.spawn_batch(new_organisms);
+    //println!("spawn organisms: {}s", now.elapsed().as_secs_f64());
 }
