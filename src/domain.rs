@@ -37,22 +37,24 @@ pub const BOUNDS: Rect = Rect {
 
 // Generic field defined on the whole domain
 pub struct Field<T> {
-    buffer: Vec<T>,
+    pub buffer: Vec<T>,
+    pub h: f32, // grid spacing
     pub idx_scale: f32, // factor to go from world coordinates to internal coordinates
     pub size: USizeVec2,
 }
 
 impl<T: Default + Copy + NumAssign> Field<T> {
     // @param subdivisions Number of subdivisions of the domain to get the resolution of this field. A negative number instead coarsens the grid.
-    pub fn new(subdivisions: i32) -> Self {
+    pub fn new(subdivisions: i32, initial_val: T) -> Self {
         let size = USizeVec2::new(
             1 << (SIZE_POW.x as i32 + subdivisions) as usize,
             1 << (SIZE_POW.y as i32 + subdivisions) as usize,
         );
 
         Field {
-            buffer: vec![T::default(); size.x * size.y],
+            buffer: vec![initial_val; size.x * size.y],
             //       subdivisions: subdivisions,
+            h: SIZE_F32.x / size.x as f32,
             idx_scale: 2.0_f32.powf(subdivisions as f32),
             size: size,
         }
@@ -147,6 +149,14 @@ impl<T: Default + Copy + NumAssign + Mul<f32, Output = T>> Field<T> {
                 }
             }
         }
+    }
+}
+
+impl<T: Default + Copy + NumAssign + Mul<f32, Output = T>> Field<T> {
+    pub fn add_volume(&mut self, pos: Vec2, value: T) {
+        let idx = self.clamp_index((pos * self.idx_scale).round().as_usizevec2());
+        let flat_idx = self.flat_index(idx);
+        self.buffer[flat_idx] += value; // / h;
     }
 }
 

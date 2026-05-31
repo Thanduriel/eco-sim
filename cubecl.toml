@@ -1,0 +1,9 @@
+[profiling]
+logger = { level = "disabled", stdout = true }
+
+[autotune]
+level = "balanced"
+logger = { level = "full", stdout = true }
+
+[compilation]
+logger = { level = "disabled", file = "cubecl.log", append = true }

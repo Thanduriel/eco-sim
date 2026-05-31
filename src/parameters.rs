@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bevy_egui::egui::Align2;
 use bevy_egui::{EguiContexts, egui};
-
+use cubecl::prelude::*;
 use egui_probe::{EguiProbe, Probe};
 
 use crate::grass;
@@ -17,7 +17,11 @@ pub const PHYSICS_TICKS_PER_SEC: f32 = 60.0;
 
 impl Default for GameSpeedParameters {
     fn default() -> Self {
-        GameSpeedParameters { auto_slow_fps: 15.0, min_speed: 0.125, max_speed: 64.0 }
+        GameSpeedParameters {
+            auto_slow_fps: 15.0,
+            min_speed: 0.125,
+            max_speed: 64.0,
+        }
     }
 }
 
@@ -29,15 +33,47 @@ pub struct SunParameters {
 
 impl Default for SunParameters {
     fn default() -> Self {
-        SunParameters { day_duration : 120.0, is_moving : false }
+        SunParameters {
+            day_duration: 120.0,
+            is_moving: false,
+        }
+    }
+}
+
+#[derive(CubeType, CubeLaunch, EguiProbe, Clone, Copy)]
+pub enum BoundaryCondition {
+    Dirichlet(f32),
+    Closed,
+}
+
+#[derive(EguiProbe)]
+pub struct DiffusionParameters {
+    pub diffusivity: f32,
+    pub bc: BoundaryCondition,
+}
+
+#[derive(EguiProbe)]
+pub struct GroundParameters {
+    pub soil_water: DiffusionParameters,
+}
+
+impl Default for GroundParameters {
+    fn default() -> Self {
+        GroundParameters {
+            soil_water: DiffusionParameters {
+                diffusivity: 0.01,
+                bc: BoundaryCondition::Dirichlet(0.5),
+            },
+        }
     }
 }
 
 #[derive(Resource, EguiProbe, Default)]
 pub struct GeneralParameters {
-    pub game_speed : GameSpeedParameters,
-    pub sun : SunParameters,
+    pub game_speed: GameSpeedParameters,
+    pub sun: SunParameters,
     pub grass: grass::GrassParameters,
+    pub ground: GroundParameters,
 }
 
 #[derive(Default)]

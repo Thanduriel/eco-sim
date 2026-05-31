@@ -26,6 +26,7 @@ mod organism;
 mod parameters;
 mod player_inputs;
 mod terrain;
+mod diffusion;
 
 fn main() {
     App::new()
@@ -75,6 +76,7 @@ fn main() {
         .add_systems(Update, player_inputs::general_actions_system)
         .add_systems(FixedUpdate, organism::update_organisms_system)
         .add_systems(FixedUpdate, organism::propagate_organisms_system)
+        .add_systems(FixedUpdate, diffusion::run_cubecl)
         .run();
 }
 

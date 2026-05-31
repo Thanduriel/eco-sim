@@ -26,6 +26,7 @@ pub struct TerrainAssets {
 #[derive(Component)]
 pub struct Surface {
     pub veg_density: domain::Field<f32>,
+    pub soil_moisture: domain::Field<f32>,
 }
 
 fn get_terrain_height(noise_map: &NoiseMap, x: usize, y: usize) -> f32 {
@@ -39,7 +40,7 @@ const BOUNDARY_POS: f32 = -0.2;
 
 impl Terrain {
     pub fn new(subdivisions: i32) -> Self {
-        let mut height_map = domain::Field::new(subdivisions);
+        let mut height_map = domain::Field::new(subdivisions, 0.0);
 
         //let fbm = noise::Fbm::<noise::Fbm<noise::Perlin>>::default();
         let noise_fn = noise::HybridMulti::<noise::Perlin>::default();
@@ -322,7 +323,8 @@ pub fn setup_terrain(
         Transform::from_xyz(domain::CENTER.x, 0.0, domain::CENTER.y),
         terrain,
         Surface {
-            veg_density: domain::Field::new(3),
+            veg_density: domain::Field::new(3, 0.0),
+            soil_moisture: domain::Field::new(2, 0.5),
         },
     ));
 }

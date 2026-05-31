@@ -15,6 +15,7 @@ enum FieldType {
     #[default]
     None,
     VegDensity,
+    SoilMoisture,
 }
 
 #[derive(Resource, Default)]
@@ -36,6 +37,8 @@ pub fn vis_fields_system(
         field_vis_state.field_type = FieldType::None;
     } else if key_input.just_pressed(KeyCode::F2) {
         field_vis_state.field_type = FieldType::VegDensity;
+    } else if key_input.just_pressed(KeyCode::F3) {
+        field_vis_state.field_type = FieldType::SoilMoisture;
     }
 
     let (mut mat3d, mesh3d) = terrain_query.single_mut().unwrap();
@@ -49,7 +52,7 @@ pub fn vis_fields_system(
                     reset_terrain_color(mesh);
                 }
             }
-            FieldType::VegDensity => {
+            FieldType::VegDensity | FieldType::SoilMoisture => {
                 mat3d.0 = terrain_assets.field_vis_material.clone();
             }
         }
@@ -68,10 +71,20 @@ pub fn vis_fields_system(
             FieldType::VegDensity => {
                 set_terrain_color(mesh, &surface.veg_density, Some((0.0, 1.0)));
             }
+            FieldType::SoilMoisture => {
+                set_terrain_color(mesh, &surface.soil_moisture, Some((0.0, 1.0)));
+            }
         };
     }
 
     //println!("{}", now.elapsed().as_secs_f64());
+}
+
+#[derive(Default, PartialEq, Copy, Clone)]
+pub enum PickingMode {
+    #[default]
+    Seed,
+    Water,
 }
 
 pub fn picking_system(
@@ -79,11 +92,20 @@ pub fn picking_system(
     grass_assets: Res<grass::GrassAssets>,
     mut ray_cast: MeshRayCast,
     terrain_query: Query<(), With<Terrain>>,
+    mut surface_query: Query<&mut Surface>,
     camera_query: Query<(&Camera, &GlobalTransform)>,
     window_query: Query<&Window>,
     mouse_button_input: Res<ButtonInput<MouseButton>>,
+    key_input: Res<ButtonInput<KeyCode>>,
     mut rng: Single<&mut WyRand, With<GlobalRng>>,
+    mut picking_mode: Local<PickingMode>,
 ) {
+    if key_input.just_released(KeyCode::Digit1) {
+        *picking_mode = PickingMode::Seed;
+    } else if key_input.just_released(KeyCode::Digit2) {
+        *picking_mode = PickingMode::Water;
+    }
+
     if !mouse_button_input.just_released(MouseButton::Right) {
         return;
     }
@@ -119,18 +141,26 @@ pub fn picking_system(
     let hits = ray_cast.cast_ray(ray, &settings);
 
     for (_, hit) in hits {
-        commands.spawn(organism::OrganismBundle {
-            mesh: Mesh3d(grass_assets.mesh.clone()),
-            no_shadow: bevy::light::NotShadowCaster::default(),
-            material: MeshMaterial3d(grass_assets.material.clone()),
-            transform: Transform::from_translation(hit.point - vec3(0.0, 0.1, 0.0))
-                .with_scale(Vec3::ZERO)
-                .with_rotation(Quat::from_axis_angle(
-                    Vec3::new(0.0, 1.0, 0.0),
-                    rng.random::<f32>() * 2.0 * PI,
-                )),
-            organism: organism::Organism::default(),
-        });
+        match *picking_mode {
+            PickingMode::Seed => {
+                commands.spawn(organism::OrganismBundle {
+                    mesh: Mesh3d(grass_assets.mesh.clone()),
+                    no_shadow: bevy::light::NotShadowCaster::default(),
+                    material: MeshMaterial3d(grass_assets.material.clone()),
+                    transform: Transform::from_translation(hit.point - vec3(0.0, 0.1, 0.0))
+                        .with_scale(Vec3::ZERO)
+                        .with_rotation(Quat::from_axis_angle(
+                            Vec3::new(0.0, 1.0, 0.0),
+                            rng.random::<f32>() * 2.0 * PI,
+                        )),
+                    organism: organism::Organism::default(),
+                });
+            }
+            PickingMode::Water => {
+                let mut surface = surface_query.single_mut().unwrap();
+                surface.soil_moisture.add_kernel(hit.point.xz(), 2.0, 1.0);
+            }
+        };
     }
 }
 
@@ -159,9 +189,9 @@ pub fn general_actions_system(
     ));
 
     // user controls
-    if relative_speed > params.game_speed.min_speed && key_input.just_pressed(KeyCode::ArrowUp) {
+    if relative_speed < params.game_speed.max_speed && key_input.just_pressed(KeyCode::ArrowUp) {
         time.set_relative_speed(relative_speed * 2.0);
-    } else if relative_speed < params.game_speed.max_speed
+    } else if relative_speed > params.game_speed.min_speed
         && key_input.just_pressed(KeyCode::ArrowDown)
     {
         time.set_relative_speed(relative_speed * 0.5);

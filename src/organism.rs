@@ -38,29 +38,36 @@ pub fn update_organisms_system(
     //let mut count = 0;
     for (id, mut transform, mut organism) in organism_query.iter_mut() {
         //count += 1;
+        let p = transform.translation.xz();
         let dt = time.delta_secs();
+        let available_water = surface.soil_moisture.get_nearest(p);
+        let required_water = general_params.grass.water_usage * dt;
+
         // still growing
+        if available_water >= required_water {
+            surface.soil_moisture.add_volume(p, -required_water);
+        }
+
         if organism.age < MAX_SIZE {
+
             let delta = dt.min(1.0 - organism.age);
             transform.scale = Vec3::ONE * (organism.age + delta);
 
             // add surface area usage
-            let center = transform.translation.xz();
             let delta_area = delta * general_params.grass.surface_area;
             surface
                 .veg_density
-                .add_kernel(center, organism.surface_area, -1.0);
+                .add_kernel(p, organism.surface_area, -1.0);
             organism.surface_area += delta_area;
             surface
                 .veg_density
-                .add_kernel(center, organism.surface_area, 1.0);
+                .add_kernel(p, organism.surface_area, 1.0);
         }
 
         organism.age += dt;
 
         // death
-        if organism.age > general_params.grass.max_age {
-            let p = transform.translation.xz();
+        if available_water < required_water || organism.age > general_params.grass.max_age {
             surface
                 .veg_density
                 .add_kernel(p, organism.surface_area, -1.0);

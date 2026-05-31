@@ -14,6 +14,7 @@ pub struct GrassParameters {
     pub orientation_max_angle: f32,
     pub below_surface_depth: f32,
     pub surface_area: f32,
+    pub water_usage: f32,
 }
 
 impl Default for GrassParameters {
@@ -24,6 +25,7 @@ impl Default for GrassParameters {
             orientation_max_angle: 0.25,
             below_surface_depth: 0.08,
             surface_area: 0.25,
+            water_usage: 0.01,
         }
     }
 }
