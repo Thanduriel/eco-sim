@@ -48,8 +48,8 @@ pub fn vis_fields_system(
         match field_vis_state.field_type {
             FieldType::None => {
                 mat3d.0 = terrain_assets.ground_material.clone();
-                if let Some(mesh) = meshes.get_mut(&mesh3d.0) {
-                    reset_terrain_color(mesh);
+                if let Some(mut mesh) = meshes.get_mut(&mesh3d.0) {
+                    reset_terrain_color(&mut mesh);
                 }
             }
             FieldType::VegDensity | FieldType::SoilMoisture => {
@@ -65,14 +65,14 @@ pub fn vis_fields_system(
     // update vertex colors to visualize field
     //let now = std::time::Instant::now();
     let surface = surface_query.single().unwrap();
-    if let Some(mesh) = meshes.get_mut(&mesh3d.0) {
+    if let Some(mut mesh) = meshes.get_mut(&mesh3d.0) {
         match field_vis_state.field_type {
             FieldType::None => panic!(),
             FieldType::VegDensity => {
-                set_terrain_color(mesh, &surface.veg_density, Some((0.0, 1.0)));
+                set_terrain_color(&mut mesh, &surface.veg_density, Some((0.0, 1.0)));
             }
             FieldType::SoilMoisture => {
-                set_terrain_color(mesh, &surface.soil_moisture, Some((0.0, 1.0)));
+                set_terrain_color(&mut mesh, &surface.soil_moisture, Some((0.0, 1.0)));
             }
         };
     }

@@ -19,6 +19,7 @@ use crate::terrain::*;
 
 mod camera_controller;
 mod color_map;
+mod diffusion;
 mod domain;
 mod grass;
 mod hud;
@@ -26,7 +27,6 @@ mod organism;
 mod parameters;
 mod player_inputs;
 mod terrain;
-mod diffusion;
 
 fn main() {
     App::new()
@@ -38,7 +38,7 @@ fn main() {
         .add_plugins(FpsOverlayPlugin {
             config: FpsOverlayConfig {
                 text_config: TextFont {
-                    font_size: 24.0,
+                    font_size: FontSize::Px(24.0),
                     ..Default::default()
                 },
                 // We can also set the refresh interval for the FPS counter
@@ -68,8 +68,9 @@ fn main() {
         .add_systems(Update, day_night_cycle)
         .add_systems(
             Update,
-            player_inputs::picking_system
-                .run_if(not(egui_wants_any_keyboard_input).and(not(egui_wants_any_pointer_input))),
+            player_inputs::picking_system.run_if(
+                not(egui_wants_any_keyboard_input).and_then(not(egui_wants_any_pointer_input)),
+            ),
         )
         .add_systems(Update, player_inputs::vis_fields_system)
         .add_systems(Update, hud::hud_system)
@@ -86,7 +87,7 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut ext_materials: ResMut<Assets<grass::GrassMaterial>>,
     mut grass_assets: ResMut<grass::GrassAssets>,
-    mut scattering_mediums: ResMut<Assets<pbr::ScatteringMedium>>,
+    mut scattering_mediums: ResMut<Assets<light::atmosphere::ScatteringMedium>>,
 ) {
     grass_assets.mesh = meshes.add(create_grass_mesh(4, 0.15));
     grass_assets.material = ext_materials.add(create_grass_material());
@@ -94,8 +95,7 @@ fn setup(
     // point light
     commands.spawn((
         PointLight {
-            shadows_enabled: true,
-
+            shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_xyz(domain::CENTER.x, 2.0, domain::CENTER.y),
@@ -105,7 +105,7 @@ fn setup(
     commands.spawn((
         DirectionalLight {
             illuminance: light_consts::lux::RAW_SUNLIGHT,
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             ..default()
         },
         light::VolumetricLight,
@@ -115,6 +115,11 @@ fn setup(
             ..default()
         },
         light::CascadeShadowConfigBuilder { ..default() }.build(),
+    ));
+
+    // atmosphere
+    commands.spawn(light::Atmosphere::earth(
+        scattering_mediums.add(light::atmosphere::ScatteringMedium::default()),
     ));
 
     // camera
@@ -128,15 +133,13 @@ fn setup(
             quality_level: pbr::ScreenSpaceAmbientOcclusionQualityLevel::High,
             constant_object_thickness: 4.0,
         },
-        // Earthlike atmosphere
-        pbr::Atmosphere::earthlike(scattering_mediums.add(pbr::ScatteringMedium::default())),
         // Can be adjusted to change the scene scale and rendering quality
         pbr::AtmosphereSettings::default(),
         // The directional light illuminance used in this scene
         // (the one recommended for use with this feature) is
         // quite bright, so raising the exposure compensation helps
         // bring the scene to a nicer brightness range.
-        camera::Exposure { ev100: 14.0 },
+        camera::Exposure { ev100: 13.0 },
         bevy::core_pipeline::tonemapping::Tonemapping::None,
         // Bloom gives the sun a much more natural look.
         Bloom::NATURAL,
@@ -157,7 +160,7 @@ fn setup(
     // game speed indicator
     commands.spawn((
         Text::new("game speed: 0.0"),
-        TextLayout::new_with_justify(Justify::Right),
+        TextLayout::justify(Justify::Right),
         Node {
             position_type: PositionType::Relative,
             bottom: px(5),

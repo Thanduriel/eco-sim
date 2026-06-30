@@ -116,10 +116,7 @@ pub fn set_terrain_color(mesh: &mut Mesh, field: &domain::Field<f32>, range: Opt
         let mut idx = index * chunk_size;
         for col in chunk {
             let pos = pos_attr_vec[idx];
-            let pos_domain = Vec2::new(
-                pos[0] + domain::CENTER.x,
-                pos[2] + domain::CENTER.y,
-            );
+            let pos_domain = Vec2::new(pos[0] + domain::CENTER.x, pos[2] + domain::CENTER.y);
             *col = cmap
                 .get_color(field.get_bilinear(pos_domain))
                 .to_f32_array();
@@ -147,10 +144,7 @@ pub fn generate_terrain_mesh(height_map: &domain::Field<f32>) -> Mesh {
 
     // modify y with height sampling
     for pos in pos_attr_vec.iter_mut() {
-        let pos_domain = Vec2::new(
-            pos[0] + domain::CENTER.x,
-            pos[2] + domain::CENTER.y,
-        );
+        let pos_domain = Vec2::new(pos[0] + domain::CENTER.x, pos[2] + domain::CENTER.y);
         let h = height_map.get_bilinear(pos_domain);
         pos[1] = h;
 
@@ -266,11 +260,15 @@ pub fn setup_terrain(
     let terrain_material = StandardMaterial {
         base_color_texture: Some(
             asset_server
-                .load_with_settings("textures/ground/PX_Soil_Ground_24_albedo.jpg", repeated),
+                .load_builder()
+                .with_settings(repeated)
+                .load("textures/ground/PX_Soil_Ground_24_albedo.jpg"),
         ),
         normal_map_texture: Some(
             asset_server
-                .load_with_settings("textures/ground/PX_Soil_Ground_24_normal.jpg", disable_srgb),
+                .load_builder()
+                .with_settings(disable_srgb)
+                .load("textures/ground/PX_Soil_Ground_24_normal.jpg"),
         ),
         /*    metallic_roughness_texture: Some(asset_server.load_with_settings(
             "textures/ground/PX_Soil_Ground_24_roughness.jpg",
@@ -278,7 +276,9 @@ pub fn setup_terrain(
         )),*/
         occlusion_texture: Some(
             asset_server
-                .load_with_settings("textures/ground/PX_Soil_Ground_24_ao.jpg", disable_srgb),
+                .load_builder()
+                .with_settings(disable_srgb)
+                .load("textures/ground/PX_Soil_Ground_24_ao.jpg"),
         ),
         //   alpha_mode: AlphaMode::Opaque,
         double_sided: false,

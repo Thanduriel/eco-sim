@@ -21,7 +21,7 @@ impl Plugin for CameraControllerPlugin {
         app.add_systems(
             Update,
             run_camera_controller
-                .run_if(not(egui_wants_any_keyboard_input).and(not(egui_wants_any_pointer_input))),
+                .run_if(not(egui_wants_any_keyboard_input).and_then(not(egui_wants_any_pointer_input))),
         );
     }
 }
