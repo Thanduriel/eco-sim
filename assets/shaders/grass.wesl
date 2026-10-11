@@ -21,6 +21,11 @@ fn vertex(in: Vertex) -> VertexOutput {
 
     var world_pos = v + vec4<f32>(model[3].xyz, 1.0);
 
+    // normal before bending, overridden when the blade is bent
+    var normal_world = mesh_functions::mesh_normal_local_to_world(
+        in.normal, in.instance_index
+    );
+
     // height in the base mesh in [0,1]
     var h = in.position.y;
     if (h > EPSILON) {
@@ -37,17 +42,27 @@ fn vertex(in: Vertex) -> VertexOutput {
                 var scale = len_v / length(in.position);
                 // angle between ground and v
                 var a = 0.5 * PI - b;
-                var tan_a = tan(a);
                 var cos_a = cos(a);
                 // Using the height as argument directly only works for very small a.
                 // Instead, we take the x of the linear function (rotated but not bend).
                 var x = h * cos_a;
-                var x_3 = x * x * x;
+                var x_2 = x * x;
+                var x_3 = x_2 * x;
                 // change in height
                 var h_bend = -GRAVITY * (x_3 - x_3 * x / 2.0) * cos_a;
 
                 // base function before bending is f(x) = tan(a) * x;
                 world_pos.y += h_bend * scale;
+
+                // blade axis and width directions in world space
+                var axis = normalize(model[1].xyz);
+                var width = normalize(model[0].xyz);
+                // slope of the bent blade, df/dh of the deflection above
+                var bend_slope = -GRAVITY * (3.0 * x_2 - 2.0 * x_3) * cos_a * cos_a;
+                // tangent to the bent surface along the blade
+                var bend_tangent = normalize(axis + vec3<f32>(0.0, bend_slope, 0.0));
+                // normal perpendicular to both the blade width and the bent tangent
+                normal_world = normalize(cross(width, bend_tangent));
             }
         }
     }
@@ -56,11 +71,7 @@ fn vertex(in: Vertex) -> VertexOutput {
     var out: VertexOutput;
     out.world_position = world_pos;
     out.position = position_world_to_clip(world_pos.xyz);
-
-    // Pass-through
-    out.world_normal = mesh_functions::mesh_normal_local_to_world(
-        in.normal, in.instance_index
-    );
+    out.world_normal = normal_world;
 
     return out;
 }
