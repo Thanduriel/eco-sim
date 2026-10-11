@@ -1,7 +1,6 @@
 use bevy::prelude::*;
 use bevy_egui::egui::Align2;
 use bevy_egui::{EguiContexts, egui};
-use cubecl::prelude::*;
 use egui_probe::{EguiProbe, Probe};
 
 use crate::grass;
@@ -40,7 +39,7 @@ impl Default for SunParameters {
     }
 }
 
-#[derive(CubeType, CubeLaunch, EguiProbe, Clone, Copy)]
+#[derive(EguiProbe, Clone, Copy)]
 pub enum BoundaryCondition {
     Dirichlet(f32),
     Closed,

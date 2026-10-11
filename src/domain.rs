@@ -1,5 +1,6 @@
-use bevy::math::{FloatPow, USizeVec2, usizevec2};
+use bevy::math::FloatPow;
 use bevy::prelude::*;
+use glam::{USizeVec2, usizevec2};
 use num_traits::{Bounded, NumAssign};
 use std::ops::{Add, Index, IndexMut, Mul};
 

@@ -81,7 +81,7 @@ pub fn create_grass_mesh(segments: usize, base_width: f32) -> Mesh {
     .with_inserted_indices(Indices::U32(triangles))
 }
 
-const SHADER_ASSET_PATH: &str = "shaders/grass.wgsl";
+const SHADER_ASSET_PATH: &str = "shaders/grass.wesl";
 
 #[derive(AsBindGroup, Asset, TypePath, Default, Debug, Clone)]
 pub struct GrassMaterialExtension {}

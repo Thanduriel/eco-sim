@@ -1,22 +1,13 @@
-#ifdef PREPASS_PIPELINE
-#import bevy_pbr::{
-    mesh_functions,
-    prepass_io::{Vertex, VertexOutput}
-    view_transformations::position_world_to_clip
-}
-#else
-#import bevy_pbr::{
-    mesh_functions,
-    forward_io::{Vertex, VertexOutput},
-    view_transformations::position_world_to_clip
-}
+@if(PREPASS_PIPELINE)
+import bevy_pbr::prepass::io::{Vertex, VertexOutput};
+@else
+import bevy_pbr::render::forward_io::{Vertex, VertexOutput};
 
-#endif
+import bevy_pbr::render::mesh_functions;
+import bevy_pbr::render::view_transformations::position_world_to_clip;
 
-const GRAVITY : f32 = 20.0;
-//const MIN_BEND_ANGLE : f32 = 0.05;
-//const MIN_BEND_HEIGHT : f32 = 0.01;
-const EPSILON : f32 = 0.01;
+const GRAVITY: f32 = 20.0;
+const EPSILON: f32 = 0.01;
 const PI = radians(180.0);
 
 @vertex
@@ -34,7 +25,7 @@ fn vertex(in: Vertex) -> VertexOutput {
     var h = in.position.y;
     if (h > EPSILON) {
         // angle between surface normal / gravity direction and blade
-        // cos(b) == v * n / ||v|| with n = (0,1,0) 
+        // cos(b) == v * n / ||v|| with n = (0,1,0)
         var len_v = length(v);
 
         if (len_v > EPSILON) {
@@ -53,7 +44,7 @@ fn vertex(in: Vertex) -> VertexOutput {
                 var x = h * cos_a;
                 var x_3 = x * x * x;
                 // change in height
-                var h_bend = -GRAVITY * (x_3 - x_3 * x / 2.0) * cos_a; 
+                var h_bend = -GRAVITY * (x_3 - x_3 * x / 2.0) * cos_a;
 
                 // base function before bending is f(x) = tan(a) * x;
                 world_pos.y += h_bend * scale;
@@ -62,7 +53,7 @@ fn vertex(in: Vertex) -> VertexOutput {
     }
 
     // fill output struct
-    var out : VertexOutput;
+    var out: VertexOutput;
     out.world_position = world_pos;
     out.position = position_world_to_clip(world_pos.xyz);
 
@@ -70,8 +61,6 @@ fn vertex(in: Vertex) -> VertexOutput {
     out.world_normal = mesh_functions::mesh_normal_local_to_world(
         in.normal, in.instance_index
     );
-    //out.color = in.color;
-    //out.uv = in.uv;
 
     return out;
 }

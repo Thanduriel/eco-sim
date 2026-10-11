@@ -1,6 +1,8 @@
 /target
 .vscode
 .cargo
+ignored
 *.log
 *.ggb
 *.pdf
+AGENTS.md

@@ -1,27 +1,21 @@
 use bevy::prelude::*;
-use cubecl::bytes::Bytes;
-//use cubecl::num_traits::{One, Zero};
-use cubecl::future;
 use cubecl::prelude::*;
-//uuse std::ops::Mul;
 
 use crate::domain;
 use crate::parameters;
-use crate::parameters::{BoundaryCondition};
+use crate::parameters::BoundaryCondition;
 use crate::terrain;
-
 
 // Finite Difference diffusion kernel
 #[cube(launch_unchecked)]
-fn diffusion_kernel_fe<F: Float + cubecl::CubeElement>(
-    input: &Array<F>,
-    output: &mut Array<F>,
+fn diffusion_kernel_fe<F: Float + LaunchArg>(
+    input: &[F],
+    output: &mut [F],
     dt: F,
     h: F,
     diffusion_coefficient: F,
     bc_type: i32,
     bc_dirichlet: F,
-    //bc: BoundaryCondition,
     size_x: usize,
     size_y: usize,
 ) {
@@ -34,15 +28,10 @@ fn diffusion_kernel_fe<F: Float + cubecl::CubeElement>(
     let center = input[x + y * size_x];
 
     let boundary_val = if bc_type == 0 {
-      bc_dirichlet
-     } else {
-        center};
-    
-    //#[comptime]
- /*   let boundary_val = match bc {
-        BoundaryCondition::Dirichlet(_) => F::new(0.0),
-        BoundaryCondition::Closed => center,
-    };*/
+        bc_dirichlet
+    } else {
+        center
+    };
 
     let left = if x > 0 {
         input[x - 1 + y * size_x]
@@ -66,63 +55,50 @@ fn diffusion_kernel_fe<F: Float + cubecl::CubeElement>(
     };
 
     output[ABSOLUTE_POS] = center
-        + dt * diffusion_coefficient * (left + right + down + up - F::new(4.0) * center) / (h * h);
-    //(input[ABSOLUTE_POS] + dt).clamp(F::zero(), F::one());
+        + dt * diffusion_coefficient * (left + right + down + up - F::new(4.0_f32) * center)
+            / (h * h);
 }
 
-fn launch<R: Runtime, F: Float + cubecl::CubeElement>(
-    device: &R::Device,
-    field: &mut domain::Field<F>,
-    dt: F,
+fn launch(
+    client: &Client,
+    field: &mut domain::Field<f32>,
+    dt: f32,
     diffusion_params: &parameters::DiffusionParameters,
 ) {
-    let start_upload = std::time::Instant::now();
-    let client = R::client(device);
     let num_elem = field.buffer.len();
-    let output_handle = client.empty(num_elem * core::mem::size_of::<F>());
-    let input_handle = client.create(Bytes::from_elems(field.buffer.clone()));
+    let output_handle = client.empty(num_elem * core::mem::size_of::<f32>());
+    let input_handle = client.create_from_slice(f32::as_bytes(&field.buffer));
     let cube_dim = 32;
- //   let _ = future::block_on(client.sync());
-  //  println!("upload: {}s", start_upload.elapsed().as_secs_f64());
 
-    let start_computation = std::time::Instant::now();
     unsafe {
-        diffusion_kernel_fe::launch_unchecked::<F, R>(
-            &client,
+        diffusion_kernel_fe::launch_unchecked::<f32>(
+            client,
             CubeCount::Static(
                 field.size.x as u32 / cube_dim,
                 field.size.y as u32 / cube_dim,
                 1,
             ),
             CubeDim::new_2d(cube_dim, cube_dim),
-            ArrayArg::from_raw_parts(input_handle, num_elem),
-            ArrayArg::from_raw_parts(output_handle.clone(), num_elem),
+            BufferArg::from_raw_parts(input_handle, num_elem),
+            BufferArg::from_raw_parts(output_handle.clone(), num_elem),
             dt,
-            F::new(field.h),
-            F::new(diffusion_params.diffusivity),
-            match diffusion_params.bc{
+            f32::new(field.h),
+            f32::new(diffusion_params.diffusivity),
+            match diffusion_params.bc {
                 BoundaryCondition::Dirichlet(_) => 0,
                 BoundaryCondition::Closed => 1,
-                
             },
-            match diffusion_params.bc{
-                BoundaryCondition::Dirichlet(val) => F::new(val),
-                BoundaryCondition::Closed => F::zero(),
+            match diffusion_params.bc {
+                BoundaryCondition::Dirichlet(val) => val,
+                BoundaryCondition::Closed => 0.0,
             },
             field.size.x,
             field.size.y,
         )
     };
-    //let _ = future::block_on(client.sync());
-    //println!("compute: {}s", start_computation.elapsed().as_secs_f64());
 
-    let start_download = std::time::Instant::now();
-    let bytes = client.read_one(output_handle).unwrap();
-    let output = F::from_bytes(&bytes);
-    field.buffer = Vec::from(output);
-    //field.buffer = bytes.try_into_vec().unwrap();
-
-    //println!("download: {}s", start_download.elapsed().as_secs_f64());
+    let bytes = client.read_one_unchecked(output_handle);
+    field.buffer = f32::from_bytes(&bytes).to_vec();
 }
 
 pub fn run_cubecl(
@@ -133,10 +109,11 @@ pub fn run_cubecl(
     if !params.ground.soil_water.is_active {
         return;
     }
-    
+
     let mut surface = surface_query.single_mut().unwrap();
-    launch::<cubecl::cuda::CudaRuntime, f32>(
-        &Default::default(),
+    let client = cubecl::Device::cuda(0).unwrap().client();
+    launch(
+        &client,
         &mut surface.soil_moisture,
         time.delta_secs(),
         &params.ground.soil_water,

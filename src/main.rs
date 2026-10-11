@@ -131,6 +131,7 @@ fn setup(
         Msaa::Off,
         pbr::ScreenSpaceAmbientOcclusion {
             quality_level: pbr::ScreenSpaceAmbientOcclusionQualityLevel::Low,
+            radius: 0.5 * 1.457,
             constant_object_thickness: 4.0,
         },
         // Can be adjusted to change the scene scale and rendering quality
