@@ -50,6 +50,7 @@ pub enum BoundaryCondition {
 pub struct DiffusionParameters {
     pub diffusivity: f32,
     pub bc: BoundaryCondition,
+    pub is_active: bool,
 }
 
 #[derive(EguiProbe)]
@@ -63,6 +64,7 @@ impl Default for GroundParameters {
             soil_water: DiffusionParameters {
                 diffusivity: 0.01,
                 bc: BoundaryCondition::Dirichlet(0.5),
+                is_active: true,
             },
         }
     }
@@ -94,7 +96,8 @@ pub fn parameter_ui_system(
     if ui_config.is_visible {
         egui::Window::new("Parameters")
             .default_open(true)
-            .max_size([300.0, 200.0])
+            .auto_sized()
+            //.max_size([300.0, 200.0])
             .anchor(Align2::RIGHT_TOP, egui::vec2(5.0, 5.0))
             .vscroll(true)
             .show(contexts.ctx_mut()?, |ui| {

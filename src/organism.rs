@@ -114,24 +114,6 @@ pub fn propagate_organisms_system(
             continue;
         }
 
-        /*  commands.spawn((
-          Mesh3d(grass_assets.mesh.clone()),
-          bevy::light::NotShadowCaster::default(),
-          MeshMaterial3d(grass_assets.material.clone()),
-          Transform::from_translation(Vec3::new(
-              p.x,
-              terrain.height_map.get_bilinear(p) - general_params.grass.below_surface_depth,
-              p.y,
-          ))
-          .with_scale(Vec3::ZERO)
-          .with_rotation(Quat::from_euler(
-              EulerRot::XYZEx,
-              (rng.random::<f32>() - 0.5) * PI * general_params.grass.orientation_max_angle,
-              rng.random::<f32>() * 2.0 * PI,
-              0.0,
-          )),
-          Organism::default(),
-        ));*/
         new_organisms.push(OrganismBundle {
             mesh: Mesh3d(grass_assets.mesh.clone()),
             no_shadow: bevy::light::NotShadowCaster::default(),

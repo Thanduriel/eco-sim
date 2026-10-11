@@ -130,7 +130,7 @@ fn setup(
         CameraController::default(),
         Msaa::Off,
         pbr::ScreenSpaceAmbientOcclusion {
-            quality_level: pbr::ScreenSpaceAmbientOcclusionQualityLevel::High,
+            quality_level: pbr::ScreenSpaceAmbientOcclusionQualityLevel::Low,
             constant_object_thickness: 4.0,
         },
         // Can be adjusted to change the scene scale and rendering quality
