@@ -56,10 +56,11 @@ fn main() {
         })
         .insert_resource(grass::GrassAssets::default())
         .add_plugins(MaterialPlugin::<grass::GrassMaterial>::default())
+        .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
         .insert_resource(Time::<Fixed>::from_hz(
             parameters::PHYSICS_TICKS_PER_SEC as f64,
         ))
-        .insert_resource(player_inputs::FieldVisState::default())
+        .insert_resource(terrain::FieldVisState::default())
         .insert_resource(parameters::GeneralParameters::default())
         .insert_resource(terrain::TerrainAssets::default())
         .add_systems(EguiPrimaryContextPass, parameters::parameter_ui_system)
@@ -73,6 +74,7 @@ fn main() {
             ),
         )
         .add_systems(Update, player_inputs::vis_fields_system)
+        .add_systems(Update, terrain::field_vis_refresh_system)
         .add_systems(Update, hud::hud_system)
         .add_systems(Update, player_inputs::general_actions_system)
         .add_systems(FixedUpdate, organism::update_organisms_system)

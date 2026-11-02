@@ -10,29 +10,12 @@ use crate::organism;
 use crate::parameters;
 use crate::terrain::*;
 
-#[derive(Default, PartialEq, Copy, Clone)]
-enum FieldType {
-    #[default]
-    None,
-    VegDensity,
-    SoilMoisture,
-}
-
-#[derive(Resource, Default)]
-pub struct FieldVisState {
-    field_type: FieldType,
-}
-
+/// Handles tfield-visualization toggle. It only records the requested field
+/// type; `terrain::field_vis_refresh_system` is responsible for applying it.
 pub fn vis_fields_system(
-    mut terrain_query: Query<(&mut MeshMaterial3d<StandardMaterial>, &Mesh3d), With<Terrain>>,
-    surface_query: Query<&Surface>,
     key_input: Res<ButtonInput<KeyCode>>,
     mut field_vis_state: ResMut<FieldVisState>,
-    terrain_assets: Res<TerrainAssets>,
-    mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    // check user inputs
-    let prev_field_vis_type = field_vis_state.field_type;
     if key_input.just_pressed(KeyCode::F1) {
         field_vis_state.field_type = FieldType::None;
     } else if key_input.just_pressed(KeyCode::F2) {
@@ -40,51 +23,13 @@ pub fn vis_fields_system(
     } else if key_input.just_pressed(KeyCode::F3) {
         field_vis_state.field_type = FieldType::SoilMoisture;
     }
-
-    let (mut mat3d, mesh3d) = terrain_query.single_mut().unwrap();
-
-    // update material
-    if prev_field_vis_type != field_vis_state.field_type {
-        match field_vis_state.field_type {
-            FieldType::None => {
-                mat3d.0 = terrain_assets.ground_material.clone();
-                if let Some(mut mesh) = meshes.get_mut(&mesh3d.0) {
-                    reset_terrain_color(&mut mesh);
-                }
-            }
-            FieldType::VegDensity | FieldType::SoilMoisture => {
-                mat3d.0 = terrain_assets.field_vis_material.clone();
-            }
-        }
-    }
-
-    if field_vis_state.field_type == FieldType::None {
-        return;
-    }
-
-    // update vertex colors to visualize field
-    //let now = std::time::Instant::now();
-    let surface = surface_query.single().unwrap();
-    if let Some(mut mesh) = meshes.get_mut(&mesh3d.0) {
-        match field_vis_state.field_type {
-            FieldType::None => panic!(),
-            FieldType::VegDensity => {
-                set_terrain_color(&mut mesh, &surface.veg_density, Some((0.0, 1.0)));
-            }
-            FieldType::SoilMoisture => {
-                set_terrain_color(&mut mesh, &surface.soil_moisture, Some((0.0, 1.0)));
-            }
-        };
-    }
-
-    //println!("{}", now.elapsed().as_secs_f64());
 }
 
 #[derive(Default, PartialEq, Copy, Clone)]
 pub enum PickingMode {
     #[default]
-    Seed,
-    Water,
+    Seed, // spawn a new organism
+    Water, // increase surface moisture
 }
 
 pub fn picking_system(

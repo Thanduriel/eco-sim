@@ -19,19 +19,17 @@ fn diffusion_kernel_fe<F: Float + LaunchArg>(
     size_x: usize,
     size_y: usize,
 ) {
-    if ABSOLUTE_POS >= input.len() {
-        terminate!();
-    }
     let x = ABSOLUTE_POS_X as usize;
     let y = ABSOLUTE_POS_Y as usize;
 
-    let center = input[x + y * size_x];
+    if x >= size_x || y >= size_y {
+        terminate!();
+    }
 
-    let boundary_val = if bc_type == 0 {
-        bc_dirichlet
-    } else {
-        center
-    };
+    let idx = x + y * size_x;
+    let center = input[idx];
+
+    let boundary_val = if bc_type == 0 { bc_dirichlet } else { center };
 
     let left = if x > 0 {
         input[x - 1 + y * size_x]
@@ -54,7 +52,7 @@ fn diffusion_kernel_fe<F: Float + LaunchArg>(
         boundary_val
     };
 
-    output[ABSOLUTE_POS] = center
+    output[idx] = center
         + dt * diffusion_coefficient * (left + right + down + up - F::new(4.0_f32) * center)
             / (h * h);
 }

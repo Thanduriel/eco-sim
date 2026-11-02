@@ -1,11 +1,16 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::color::{Color, Mix};
 use bevy::image::{
-    Image, ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor,
+    Image, ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler,
+    ImageSamplerDescriptor,
 };
 use bevy::mesh::VertexAttributeValues;
+use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
+use bevy::render::render_resource::{
+    AsBindGroup, Extent3d, Face, ShaderType, TextureDimension, TextureFormat,
+};
+use bevy::shader::ShaderRef;
 use bevy::tasks::{ComputeTaskPool, ParallelSliceMut};
 
 use crate::{color_map, domain};
@@ -18,9 +23,91 @@ pub struct Terrain {
 
 #[derive(Resource, Default)]
 pub struct TerrainAssets {
-    pub ground_material: Handle<StandardMaterial>,
-    pub field_vis_material: Handle<StandardMaterial>,
+    pub terrain_material: Handle<TerrainMaterial>,
+    /// `Rgba8Unorm` texture holding the value of the currently visualized field (in the red
+    /// channel).
     pub field_vis_image: Handle<Image>,
+    /// Colormap LUT (256 x 1, linear) sampled by the field visualization shader.
+    pub color_lut_image: Handle<Image>,
+}
+
+/// Whether a field is defined on grid *vertices* (point values, interpolated smoothly
+/// between neighbors) or per *cell* (one constant value per cell, shaded flat).
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum FieldKind {
+    /// Value at grid point `i` lives at world position `i * h
+    #[default]
+    Vertex,
+    /// One value per cell
+    #[allow(dead_code)]
+    Cell,
+}
+
+#[derive(Default, PartialEq, Eq, Copy, Clone, Debug)]
+pub enum FieldType {
+    #[default]
+    None,
+    VegDensity,   // [0,1]
+    SoilMoisture, // [0, ∞)
+}
+
+impl FieldType {
+    // mapping of
+    pub fn kind(self) -> FieldKind {
+        match self {
+            FieldType::None | FieldType::VegDensity | FieldType::SoilMoisture => FieldKind::Vertex,
+        }
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct FieldVisState {
+    pub field_type: FieldType,
+}
+
+/// GPU representation of the field-visualization parameters.
+#[derive(Clone, Copy, Default, Debug, ShaderType)]
+#[repr(C)]
+pub struct FieldVisUniform {
+    /// 0 = ground, 1 = field overlay (fragment shader mixes on this).
+    pub weight: f32,
+    /// Value range mapped onto the colormap.
+    pub min: f32,
+    pub max: f32,
+    /// Field resolution along one axis (texel count).
+    pub field_size: f32,
+    /// World size of the domain along one axis (see `domain::SIZE`).
+    pub domain_size: f32,
+    /// Half-texel shift used to align grid points with texel centers (0.0 for cell fields).
+    pub half_texel: f32,
+    /// `FieldKind` as `u32` (0 = Vertex, 1 = Cell).
+    pub kind: u32,
+    // Padding to keep the uniform at a 16-byte multiple.
+    _pad: u32,
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Clone, Debug, Default)]
+pub struct FieldVisExtension {
+    #[uniform(100)]
+    pub uniform: FieldVisUniform,
+    #[texture(101)]
+    #[sampler(102)]
+    pub field_texture: Option<Handle<Image>>,
+    #[texture(103)]
+    #[sampler(104)]
+    pub color_lut: Option<Handle<Image>>,
+}
+
+pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, FieldVisExtension>;
+
+impl MaterialExtension for FieldVisExtension {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/field_vis.wesl".into()
+    }
+
+    fn deferred_fragment_shader() -> ShaderRef {
+        "shaders/field_vis.wesl".into()
+    }
 }
 
 #[derive(Component)]
@@ -70,6 +157,7 @@ fn get_terrain_color(height: f32) -> Color {
     Color::linear_rgb(0.75, 0.75, 0.75).mix(&Color::WHITE, t)
 }
 
+#[allow(dead_code)]
 pub fn reset_terrain_color(mesh: &mut Mesh) {
     let mut color_attr = mesh.remove_attribute(Mesh::ATTRIBUTE_COLOR).unwrap();
     let VertexAttributeValues::Float32x4(ref mut col_attr_vec) = color_attr else {
@@ -90,6 +178,7 @@ pub fn reset_terrain_color(mesh: &mut Mesh) {
 
 // Set the color at each vertex to the one in field.
 // If no range is provided, min and max values of the field are used.
+#[allow(dead_code)]
 pub fn set_terrain_color(mesh: &mut Mesh, field: &domain::Field<f32>, range: Option<(f32, f32)>) {
     let mut color_attr = mesh.remove_attribute(Mesh::ATTRIBUTE_COLOR).unwrap();
     let VertexAttributeValues::Float32x4(ref mut col_attr_vec) = color_attr else {
@@ -235,7 +324,7 @@ pub fn set_image_from_field(
 pub fn setup_terrain(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<TerrainMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut terrain_assets: ResMut<TerrainAssets>,
     asset_server: Res<AssetServer>,
@@ -256,8 +345,8 @@ pub fn setup_terrain(
         });
     };
 
-    // terrain
-    let terrain_material = StandardMaterial {
+    // ground base material (also the base of `TerrainMaterial`)
+    let ground_material = StandardMaterial {
         base_color_texture: Some(
             asset_server
                 .load_builder()
@@ -290,11 +379,15 @@ pub fn setup_terrain(
         cull_mode: Some(Face::Back),
         ..default()
     };
-    terrain_assets.ground_material = materials.add(terrain_material);
 
     let terrain = Terrain::new(3);
 
-    // (debug) visualize fields
+    // (debug) visualize fields.
+    // The active field is stored in the red channel as an `Rgba8Unorm` texture. Unlike
+    // `R32Float`, `Rgba8Unorm` is filterable on every adapter (it does not need the
+    // `float32-filterable` feature), so a linear sampler always binds — otherwise one bad
+    // binding would break the whole material, including the ground. Fields are in [0, 1]
+    // and are colormapped on the GPU, so 8-bit precision is plenty for a debug view.
     let mut field_vis_image = Image::new_fill(
         Extent3d {
             width: terrain.height_map.size.x as u32,
@@ -302,24 +395,37 @@ pub fn setup_terrain(
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        &[255u8; 4],
+        &[0u8; 4],
         TextureFormat::Rgba8Unorm,
         RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
     );
-    field_vis_image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::nearest());
+    field_vis_image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::linear());
     terrain_assets.field_vis_image = images.add(field_vis_image);
 
-    let field_vis_material = StandardMaterial {
-        base_color_texture: Some(terrain_assets.field_vis_image.clone()),
-        double_sided: false,
-        cull_mode: Some(Face::Back),
-        ..default()
+    // Colormap LUT sampled by the shader (linear space to match `color_map::ColorMap`).
+    terrain_assets.color_lut_image = images.add(build_field_color_lut());
+
+    let terrain_material = TerrainMaterial {
+        base: ground_material,
+        extension: FieldVisExtension {
+            uniform: FieldVisUniform {
+                weight: 0.0,
+                min: 0.0,
+                max: 1.0,
+                field_size: terrain.height_map.size.x as f32,
+                domain_size: domain::SIZE.x as f32,
+                half_texel: 0.5 / terrain.height_map.size.x as f32,
+                ..default()
+            },
+            field_texture: Some(terrain_assets.field_vis_image.clone()),
+            color_lut: Some(terrain_assets.color_lut_image.clone()),
+        },
     };
-    terrain_assets.field_vis_material = materials.add(field_vis_material);
+    terrain_assets.terrain_material = materials.add(terrain_material);
 
     commands.spawn((
         Mesh3d(meshes.add(generate_terrain_mesh(&terrain.height_map))),
-        MeshMaterial3d(terrain_assets.ground_material.clone()),
+        MeshMaterial3d(terrain_assets.terrain_material.clone()),
         Transform::from_xyz(domain::CENTER.x, 0.0, domain::CENTER.y),
         terrain,
         Surface {
@@ -327,4 +433,147 @@ pub fn setup_terrain(
             soil_moisture: domain::Field::new(2, 0.5),
         },
     ));
+}
+
+/// Builds the 256 x 1 linear-space colormap LUT used by the field visualization shader.
+fn build_field_color_lut() -> Image {
+    const LUT_SIZE: u32 = 256;
+    let cmap = color_map::ColorMap::new(0.0, 1.0, color_map::ColorScheme::Incandescent);
+    let mut data = Vec::with_capacity((LUT_SIZE * 4) as usize);
+    for i in 0..LUT_SIZE {
+        let t = i as f32 / (LUT_SIZE - 1) as f32;
+        data.extend_from_slice(&cmap.get_color(t).to_u8_array());
+    }
+
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: LUT_SIZE,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0u8; 4],
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+    );
+    image.data = Some(data);
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::linear());
+    image
+}
+
+/// Returns the field that the given visualization type displays, if any.
+fn visible_field(field_type: FieldType, surface: &Surface) -> Option<&domain::Field<f32>> {
+    match field_type {
+        FieldType::None => None,
+        FieldType::VegDensity => Some(&surface.veg_density),
+        FieldType::SoilMoisture => Some(&surface.soil_moisture),
+    }
+}
+
+/// Writes the field values into the `Rgba8Unorm` texture (value in the red channel),
+/// resizing it if the field's resolution changed. Fields are clamped to [0, 1]; the shader
+/// maps them through the colormap LUT. This is the only per-tick CPU work the visualization
+/// needs.
+fn write_field_to_image(image: &mut Image, field: &domain::Field<f32>) {
+    let n = field.size.x as u32;
+    let extent = Extent3d {
+        width: n,
+        height: n,
+        depth_or_array_layers: 1,
+    };
+    if image.size() != UVec2::new(n, n) {
+        image.resize(extent);
+    }
+    let Some(data) = image.data.as_mut() else {
+        return;
+    };
+    for (dst, &v) in data.chunks_exact_mut(4).zip(field.buffer.iter()) {
+        let v = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        dst[0] = v;
+        dst[1] = v;
+        dst[2] = v;
+        dst[3] = 255;
+    }
+}
+
+/// Applies the current visualization mode to the terrain material and field texture. This is the
+/// single place that writes to the field image; it is invoked by [`field_vis_refresh_system`]
+/// whenever the selected field changes or the simulation mutates [`Surface`].
+fn configure_field_vis(
+    state: &FieldVisState,
+    terrain_assets: &TerrainAssets,
+    materials: &mut Assets<TerrainMaterial>,
+    images: &mut Assets<Image>,
+    surface: &Surface,
+) {
+    let Some(field) = visible_field(state.field_type, surface) else {
+        // Hide the overlay but leave the texture resized/buffered as-is. Cheap and rare.
+        if let Some(mut mat) = materials.get_mut(&terrain_assets.terrain_material) {
+            mat.extension.uniform.weight = 0.0;
+        }
+        return;
+    };
+
+    let kind = state.field_type.kind();
+    let n = field.size.x as f32;
+    let filter = match kind {
+        FieldKind::Vertex => ImageFilterMode::Linear,
+        FieldKind::Cell => ImageFilterMode::Nearest,
+    };
+
+    if let Some(mut image) = images.get_mut(&terrain_assets.field_vis_image) {
+        let mut desc = ImageSamplerDescriptor::linear();
+        desc.set_filter(filter);
+        image.sampler = ImageSampler::Descriptor(desc);
+        write_field_to_image(&mut image, field);
+    }
+
+    if let Some(mut mat) = materials.get_mut(&terrain_assets.terrain_material) {
+        let u = &mut mat.extension.uniform;
+        u.weight = 1.0;
+        u.min = 0.0;
+        u.max = 1.0;
+        u.field_size = n;
+        u.domain_size = domain::SIZE.x as f32;
+        u.half_texel = match kind {
+            FieldKind::Vertex => 0.5 / n,
+            FieldKind::Cell => 0.0,
+        };
+        u.kind = kind as u32;
+    }
+}
+
+/// It refreshes when either:
+///   * the selected field changed, or
+///   * the simulation mutated `Surface` (change detection, so we skip idle frames and don't
+///     re-upload on every `FixedUpdate` tick, which can run several times per frame at high
+///     game speed).
+/// This is what feeds Bevy's main-world -> render-world `RenderAsset<Image>` extraction; all
+/// writes to the field image happen in `configure_field_vis`.
+pub fn field_vis_refresh_system(
+    surface_query: Query<Ref<Surface>>,
+    state: Res<FieldVisState>,
+    terrain_assets: Res<TerrainAssets>,
+    mut materials: ResMut<Assets<TerrainMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut last_field_type: Local<Option<FieldType>>,
+) {
+    let Ok(surface) = surface_query.single() else {
+        return;
+    };
+
+    // user selected another field or current field values changed
+    let field_type_changed = *last_field_type != Some(state.field_type);
+    if !field_type_changed && !surface.is_changed() {
+        return;
+    }
+    *last_field_type = Some(state.field_type);
+
+    configure_field_vis(
+        &state,
+        &terrain_assets,
+        &mut materials,
+        &mut images,
+        &surface,
+    );
 }
