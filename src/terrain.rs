@@ -1,8 +1,7 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::color::{Color, Mix};
 use bevy::image::{
-    Image, ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler,
-    ImageSamplerDescriptor,
+    Image, ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor,
 };
 use bevy::mesh::VertexAttributeValues;
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
@@ -13,7 +12,7 @@ use bevy::render::render_resource::{
 use bevy::shader::ShaderRef;
 use bevy::tasks::{ComputeTaskPool, ParallelSliceMut};
 
-use crate::{color_map, domain};
+use crate::{color_map, domain, gpu};
 use noise::utils::{NoiseMap, NoiseMapBuilder};
 
 #[derive(Component)]
@@ -383,23 +382,23 @@ pub fn setup_terrain(
     let terrain = Terrain::new(3);
 
     // (debug) visualize fields.
-    // The active field is stored in the red channel as an `Rgba8Unorm` texture. Unlike
-    // `R32Float`, `Rgba8Unorm` is filterable on every adapter (it does not need the
-    // `float32-filterable` feature), so a linear sampler always binds — otherwise one bad
-    // binding would break the whole material, including the ground. Fields are in [0, 1]
-    // and are colormapped on the GPU, so 8-bit precision is plenty for a debug view.
-    let mut field_vis_image = Image::new_fill(
+    // The active field is stored as `Rgba32Float` texels (`[value, 0, 0, 0]`, value in the
+    // red channel), matching what the cubecl prep kernel (`gpu::field_values_to_texels`)
+    // writes, so the sim output can be moved into this texture with a GPU-only
+    // `copy_buffer_to_texture`. Sampling happens via `textureLoad` + manual bilinear in the
+    // shader: `Rgba32Float` is not linearly filterable without the `float32-filterable`
+    // feature (one bad binding would break the whole material).
+    let mut field_vis_image = Image::new_uninit(
         Extent3d {
             width: terrain.height_map.size.x as u32,
             height: terrain.height_map.size.y as u32,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        &[0u8; 4],
-        TextureFormat::Rgba8Unorm,
+        TextureFormat::Rgba32Float,
         RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
     );
-    field_vis_image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::linear());
+    field_vis_image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::nearest());
     terrain_assets.field_vis_image = images.add(field_vis_image);
 
     // Colormap LUT sampled by the shader (linear space to match `color_map::ColorMap`).
@@ -470,10 +469,10 @@ fn visible_field(field_type: FieldType, surface: &Surface) -> Option<&domain::Fi
     }
 }
 
-/// Writes the field values into the `Rgba8Unorm` texture (value in the red channel),
-/// resizing it if the field's resolution changed. Fields are clamped to [0, 1]; the shader
-/// maps them through the colormap LUT. This is the only per-tick CPU work the visualization
-/// needs.
+/// Writes the field values into the `Rgba32Float` texture (value in the red channel,
+/// `[v, 0, 0, 0]` texels), resizing it if the field's resolution changed. Used for
+/// CPU-resident fields; GPU-resident fields are written to the same texture by the
+/// render-world `copy_buffer_to_texture` path instead.
 fn write_field_to_image(image: &mut Image, field: &domain::Field<f32>) {
     let n = field.size.x as u32;
     let extent = Extent3d {
@@ -484,48 +483,68 @@ fn write_field_to_image(image: &mut Image, field: &domain::Field<f32>) {
     if image.size() != UVec2::new(n, n) {
         image.resize(extent);
     }
+    if image.data.is_none() {
+        image.data = Some(vec![0u8; (n * n) as usize * core::mem::size_of::<f32>() * 4]);
+    }
     let Some(data) = image.data.as_mut() else {
         return;
     };
-    for (dst, &v) in data.chunks_exact_mut(4).zip(field.buffer.iter()) {
-        let v = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-        dst[0] = v;
-        dst[1] = v;
-        dst[2] = v;
-        dst[3] = 255;
+    for (dst, &v) in data.chunks_exact_mut(16).zip(field.buffer.iter()) {
+        let v = v.clamp(0.0, 1.0);
+        dst[0..4].copy_from_slice(&v.to_le_bytes());
+        dst[4..].fill(0);
     }
 }
 
-/// Applies the current visualization mode to the terrain material and field texture. This is the
-/// single place that writes to the field image; it is invoked by [`field_vis_refresh_system`]
+/// Applies the current visualization mode to the terrain material and field texture. This is
+/// the single place that configures the field image; it is invoked by [`field_vis_refresh_system`]
 /// whenever the selected field changes or the simulation mutates [`Surface`].
+///
+/// * CPU-resident fields (currently `VegDensity`) are written here via
+///   [`write_field_to_image`].
+/// * GPU-resident fields (`SoilMoisture`, written by cubecl on Bevy's device) skip the CPU
+///   write: [`gpu::FieldVisGpuData`] is marked active instead and the render-world copy
+///   system uploads the sim buffer into the texture every frame.
 fn configure_field_vis(
     state: &FieldVisState,
     terrain_assets: &TerrainAssets,
     materials: &mut Assets<TerrainMaterial>,
     images: &mut Assets<Image>,
     surface: &Surface,
+    field_vis_gpu: Option<&mut gpu::FieldVisGpuData>,
 ) {
     let Some(field) = visible_field(state.field_type, surface) else {
         // Hide the overlay but leave the texture resized/buffered as-is. Cheap and rare.
         if let Some(mut mat) = materials.get_mut(&terrain_assets.terrain_material) {
             mat.extension.uniform.weight = 0.0;
         }
+        if let Some(gpu) = field_vis_gpu {
+            gpu.active = false;
+        }
         return;
     };
 
     let kind = state.field_type.kind();
     let n = field.size.x as f32;
-    let filter = match kind {
-        FieldKind::Vertex => ImageFilterMode::Linear,
-        FieldKind::Cell => ImageFilterMode::Nearest,
-    };
 
     if let Some(mut image) = images.get_mut(&terrain_assets.field_vis_image) {
-        let mut desc = ImageSamplerDescriptor::linear();
-        desc.set_filter(filter);
-        image.sampler = ImageSampler::Descriptor(desc);
-        write_field_to_image(&mut image, field);
+        let extent = Extent3d {
+            width: field.size.x as u32,
+            height: field.size.y as u32,
+            depth_or_array_layers: 1,
+        };
+        if image.size() != UVec2::new(field.size.x as u32, field.size.y as u32) {
+            image.resize(extent);
+        }
+        // The shader resamples with `textureLoad` + manual bilinear interpolation, so the
+        // sampler is never used for fields; keep it nearest to be safe on Rgba32Float.
+        image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::nearest());
+        if state.field_type != FieldType::SoilMoisture {
+            // CPU-resident field: write the data here (re-uploaded via RenderAsset).
+            write_field_to_image(&mut image, field);
+        }
+        // `SoilMoisture` is left untouched on the CPU: the sim buffer is copied into the
+        // texture on the GPU every frame.
     }
 
     if let Some(mut mat) = materials.get_mut(&terrain_assets.terrain_material) {
@@ -541,6 +560,10 @@ fn configure_field_vis(
         };
         u.kind = kind as u32;
     }
+
+    if let Some(gpu) = field_vis_gpu {
+        gpu.active = state.field_type == FieldType::SoilMoisture;
+    }
 }
 
 /// It refreshes when either:
@@ -548,14 +571,16 @@ fn configure_field_vis(
 ///   * the simulation mutated `Surface` (change detection, so we skip idle frames and don't
 ///     re-upload on every `FixedUpdate` tick, which can run several times per frame at high
 ///     game speed).
-/// This is what feeds Bevy's main-world -> render-world `RenderAsset<Image>` extraction; all
-/// writes to the field image happen in `configure_field_vis`.
+/// It feeds Bevy's main-world -> render-world `RenderAsset<Image>` extraction for
+/// CPU-resident fields; GPU-resident fields are published via [`gpu::FieldVisGpuData`] and
+/// copied into the texture in the render world.
 pub fn field_vis_refresh_system(
     surface_query: Query<Ref<Surface>>,
     state: Res<FieldVisState>,
     terrain_assets: Res<TerrainAssets>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut field_vis_gpu: Option<ResMut<gpu::FieldVisGpuData>>,
     mut last_field_type: Local<Option<FieldType>>,
 ) {
     let Ok(surface) = surface_query.single() else {
@@ -575,5 +600,6 @@ pub fn field_vis_refresh_system(
         &mut materials,
         &mut images,
         &surface,
+        field_vis_gpu.as_deref_mut(),
     );
 }

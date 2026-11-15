@@ -22,6 +22,7 @@ mod color_map;
 mod diffusion;
 mod domain;
 mod grass;
+mod gpu;
 mod hud;
 mod organism;
 mod parameters;
@@ -32,6 +33,7 @@ fn main() {
     App::new()
         .insert_resource(GlobalAmbientLight::NONE)
         .add_plugins(DefaultPlugins)
+        .add_plugins(gpu::GpuRenderCopyPlugin)
         .add_plugins(EguiPlugin::default())
         .add_plugins(CameraControllerPlugin)
         .add_plugins(EntropyPlugin::<WyRand>::default())
@@ -61,10 +63,12 @@ fn main() {
             parameters::PHYSICS_TICKS_PER_SEC as f64,
         ))
         .insert_resource(terrain::FieldVisState::default())
+        .insert_resource(gpu::FieldVisGpuData::default())
         .insert_resource(parameters::GeneralParameters::default())
         .insert_resource(terrain::TerrainAssets::default())
         .add_systems(EguiPrimaryContextPass, parameters::parameter_ui_system)
         .add_systems(Startup, setup)
+        .add_systems(Startup, gpu::setup_gpu_context)
         .add_systems(Startup, terrain::setup_terrain)
         .add_systems(Update, day_night_cycle)
         .add_systems(
