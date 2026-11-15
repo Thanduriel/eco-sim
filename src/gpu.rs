@@ -154,6 +154,7 @@ fn copy_field_vis_to_texture(
         return;
     }
 
+
     // 4 f32 per texel.
     let bytes_per_row = (src.width * core::mem::size_of::<f32>() as u32 * 4).max(256);
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {

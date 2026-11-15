@@ -79,9 +79,28 @@ pub struct WaterParameters {
     /// Initial water block extents (x, y, z) placed at the world center.
     pub blob_size: [f32; 3],
     /// Particle count per splat cell that maps to full color in the F5 overlay.
+    ///
+    /// The field-vis LUT (Incandescent in `color_map.rs`) is inverted: 0 = white,
+    /// 1 = deep red. Seeded particles pack up to ~4 per 0.25 m splat cell, so the
+    /// scale must be that magnitude for the blob to use the colored part of the LUT.
     pub debug_count_scale: f32,
     /// Tangential damping on terrain contact (smooth the dambreak settling).
     pub terrain_friction: f32,
+    /// SPH: rest density ρ0 (kg/m³).
+    pub fluid_density: f32,
+    /// SPH: reference sound speed c0 (m/s); the Tait exponent gamma is implied by
+    /// `p = B((rho/rho0)^gamma - 1)` with `B = rho0 c0^2 / gamma`.
+    pub sound_speed: f32,
+    /// SPH: Tait exponent gamma.
+    pub gamma: f32,
+    /// SPH: Monaghan artificial viscosity coefficient alpha.
+    pub viscosity_alpha: f32,
+    /// SPH: density clamp (`rho >= stiffness_clamp * rho0`) to limit negative pressure.
+    pub stiffness_clamp: f32,
+    /// SPH: smoothing length as a multiple of the particle spacing (`h = ratio * spacing`).
+    pub smoothing_ratio: f32,
+    /// Grid extent in y used for the neighbor cells (particles above this are invalid).
+    pub max_particle_height: f32,
 }
 
 impl Default for WaterParameters {
@@ -91,8 +110,15 @@ impl Default for WaterParameters {
             substeps: 4,
             particle_spacing: 0.5,
             blob_size: [12.0, 2.0, 12.0],
-            debug_count_scale: 32.0,
+            debug_count_scale: 4.0,
             terrain_friction: 3.0,
+            fluid_density: 1000.0,
+            sound_speed: 20.0,
+            gamma: 7.0,
+            viscosity_alpha: 0.1,
+            stiffness_clamp: 0.1,
+            smoothing_ratio: 1.3,
+            max_particle_height: 8.0,
         }
     }
 }
