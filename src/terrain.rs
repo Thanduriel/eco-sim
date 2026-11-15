@@ -46,15 +46,19 @@ pub enum FieldKind {
 pub enum FieldType {
     #[default]
     None,
-    VegDensity,   // [0,1]
-    SoilMoisture, // [0, ∞)
+    VegDensity,   // [0,1] - CPU-resident
+    SoilMoisture, // [0, ∞) - GPU-resident (diffusion output)
+    WaterHeight,  // [0,1] - GPU-resident (particle splat, normalized)
 }
 
 impl FieldType {
     // mapping of
     pub fn kind(self) -> FieldKind {
         match self {
-            FieldType::None | FieldType::VegDensity | FieldType::SoilMoisture => FieldKind::Vertex,
+            FieldType::None
+            | FieldType::VegDensity
+            | FieldType::SoilMoisture
+            | FieldType::WaterHeight => FieldKind::Vertex,
         }
     }
 }
@@ -461,9 +465,10 @@ fn build_field_color_lut() -> Image {
 }
 
 /// Returns the field that the given visualization type displays, if any.
+#[allow(dead_code)]
 fn visible_field(field_type: FieldType, surface: &Surface) -> Option<&domain::Field<f32>> {
     match field_type {
-        FieldType::None => None,
+        FieldType::None | FieldType::WaterHeight => None,
         FieldType::VegDensity => Some(&surface.veg_density),
         FieldType::SoilMoisture => Some(&surface.soil_moisture),
     }
@@ -502,9 +507,9 @@ fn write_field_to_image(image: &mut Image, field: &domain::Field<f32>) {
 ///
 /// * CPU-resident fields (currently `VegDensity`) are written here via
 ///   [`write_field_to_image`].
-/// * GPU-resident fields (`SoilMoisture`, written by cubecl on Bevy's device) skip the CPU
-///   write: [`gpu::FieldVisGpuData`] is marked active instead and the render-world copy
-///   system uploads the sim buffer into the texture every frame.
+/// * GPU-resident fields (`SoilMoisture` diffusion output, `WaterHeight` particle splat)
+///   skip the CPU write: [`gpu::FieldVisGpuData`] is marked active and the render-world
+///   copy system uploads the sim buffer into the texture every frame.
 fn configure_field_vis(
     state: &FieldVisState,
     terrain_assets: &TerrainAssets,
@@ -513,7 +518,7 @@ fn configure_field_vis(
     surface: &Surface,
     field_vis_gpu: Option<&mut gpu::FieldVisGpuData>,
 ) {
-    let Some(field) = visible_field(state.field_type, surface) else {
+    if state.field_type == FieldType::None {
         // Hide the overlay but leave the texture resized/buffered as-is. Cheap and rare.
         if let Some(mut mat) = materials.get_mut(&terrain_assets.terrain_material) {
             mat.extension.uniform.weight = 0.0;
@@ -522,29 +527,45 @@ fn configure_field_vis(
             gpu.active = false;
         }
         return;
-    };
+    }
 
     let kind = state.field_type.kind();
-    let n = field.size.x as f32;
+    let (n, cpu_write, source) = match state.field_type {
+        FieldType::VegDensity => (surface.veg_density.size.x as f32, true, gpu::FieldVisSource::Soil),
+        FieldType::SoilMoisture => {
+            let w = field_vis_gpu
+                .as_ref()
+                .map(|g| g.soil.width.max(1))
+                .unwrap_or(256);
+            (w as f32, false, gpu::FieldVisSource::Soil)
+        }
+        FieldType::WaterHeight => {
+            let w = field_vis_gpu
+                .as_ref()
+                .map(|g| g.water.width.max(1))
+                .unwrap_or(256);
+            (w as f32, false, gpu::FieldVisSource::Water)
+        }
+        FieldType::None => unreachable!(),
+    };
 
     if let Some(mut image) = images.get_mut(&terrain_assets.field_vis_image) {
-        let extent = Extent3d {
-            width: field.size.x as u32,
-            height: field.size.y as u32,
-            depth_or_array_layers: 1,
-        };
-        if image.size() != UVec2::new(field.size.x as u32, field.size.y as u32) {
-            image.resize(extent);
+        let size = n as u32;
+        if image.size() != UVec2::new(size, size) {
+            image.resize(Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            });
         }
         // The shader resamples with `textureLoad` + manual bilinear interpolation, so the
         // sampler is never used for fields; keep it nearest to be safe on Rgba32Float.
         image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::nearest());
-        if state.field_type != FieldType::SoilMoisture {
-            // CPU-resident field: write the data here (re-uploaded via RenderAsset).
-            write_field_to_image(&mut image, field);
+        if cpu_write {
+            write_field_to_image(&mut image, &surface.veg_density);
         }
-        // `SoilMoisture` is left untouched on the CPU: the sim buffer is copied into the
-        // texture on the GPU every frame.
+        // GPU-resident fields are left untouched on the CPU: the sim buffer is copied
+        // into the texture on the GPU every frame.
     }
 
     if let Some(mut mat) = materials.get_mut(&terrain_assets.terrain_material) {
@@ -562,7 +583,8 @@ fn configure_field_vis(
     }
 
     if let Some(gpu) = field_vis_gpu {
-        gpu.active = state.field_type == FieldType::SoilMoisture;
+        gpu.active = !cpu_write;
+        gpu.source = source;
     }
 }
 

@@ -22,6 +22,8 @@ pub fn vis_fields_system(
         field_vis_state.field_type = FieldType::VegDensity;
     } else if key_input.just_pressed(KeyCode::F3) {
         field_vis_state.field_type = FieldType::SoilMoisture;
+    } else if key_input.just_pressed(KeyCode::F5) {
+        field_vis_state.field_type = FieldType::WaterHeight;
     }
 }
 

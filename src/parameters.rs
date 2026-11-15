@@ -69,12 +69,41 @@ impl Default for GroundParameters {
     }
 }
 
+#[derive(EguiProbe)]
+pub struct WaterParameters {
+    pub is_active: bool,
+    /// Inner integration steps per physics tick (constant, keeps the fixed timestep).
+    pub substeps: u32,
+    /// Initial particle spacing (smaller = more particles).
+    pub particle_spacing: f32,
+    /// Initial water block extents (x, y, z) placed at the world center.
+    pub blob_size: [f32; 3],
+    /// Particle count per splat cell that maps to full color in the F5 overlay.
+    pub debug_count_scale: f32,
+    /// Tangential damping on terrain contact (smooth the dambreak settling).
+    pub terrain_friction: f32,
+}
+
+impl Default for WaterParameters {
+    fn default() -> Self {
+        WaterParameters {
+            is_active: true,
+            substeps: 4,
+            particle_spacing: 0.5,
+            blob_size: [12.0, 2.0, 12.0],
+            debug_count_scale: 32.0,
+            terrain_friction: 3.0,
+        }
+    }
+}
+
 #[derive(Resource, EguiProbe, Default)]
 pub struct GeneralParameters {
     pub game_speed: GameSpeedParameters,
     pub sun: SunParameters,
     pub grass: grass::GrassParameters,
     pub ground: GroundParameters,
+    pub water: WaterParameters,
 }
 
 #[derive(Default)]

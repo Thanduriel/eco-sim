@@ -28,6 +28,7 @@ mod organism;
 mod parameters;
 mod player_inputs;
 mod terrain;
+mod water;
 
 fn main() {
     App::new()
@@ -68,8 +69,10 @@ fn main() {
         .insert_resource(terrain::TerrainAssets::default())
         .add_systems(EguiPrimaryContextPass, parameters::parameter_ui_system)
         .add_systems(Startup, setup)
-        .add_systems(Startup, gpu::setup_gpu_context)
-        .add_systems(Startup, terrain::setup_terrain)
+        .add_systems(
+            Startup,
+            (gpu::setup_gpu_context, terrain::setup_terrain, water::setup_water).chain(),
+        )
         .add_systems(Update, day_night_cycle)
         .add_systems(
             Update,
@@ -84,6 +87,7 @@ fn main() {
         .add_systems(FixedUpdate, organism::update_organisms_system)
         .add_systems(FixedUpdate, organism::propagate_organisms_system)
         .add_systems(FixedUpdate, diffusion::run_cubecl)
+        .add_systems(FixedUpdate, water::run_water)
         .run();
 }
 

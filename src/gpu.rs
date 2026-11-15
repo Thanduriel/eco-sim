@@ -78,24 +78,41 @@ pub fn field_values_to_texels<F: Float + LaunchArg>(
     output[out + 3] = F::new(0.0_f32);
 }
 
-/// The sim-side handle to the renderer: the buffer written by cubecl plus where (in
-/// which texture, at which size) a render-world system should copy it each frame.
+/// Which GPU-resident buffer currently backs the field visualization.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FieldVisSource {
+    #[default]
+    Soil,
+    Water,
+}
+
+/// A cubecl-allocated buffer publishing GPU-resident texels for rendering.
+#[derive(Clone, Debug, Default)]
+pub struct VisBuffer {
+    /// Stream of `Rgba32Float` texels (value in the red channel); `None` until the
+    /// first simulation tick ran.
+    pub buffer: Option<wgpu::Buffer>,
+    /// Byte offset into the buffer (cubecl may give back a slice of a larger block).
+    pub offset: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The sim-side handle to the renderer: which buffer feeds the visualization texture,
+/// plus where (in which texture) a render-world system should copy it each frame.
 ///
 /// Main world is the source; the render world receives a clone via
 /// [`ExtractResource`] (cheap: holds an `Arc` into the wgpu buffer).
 #[derive(Resource, Clone, ExtractResource)]
 #[extract_app(RenderApp)]
 pub struct FieldVisGpuData {
-    /// The cubecl-allocated buffer holding a stream of `Rgba32Float` texels
-    /// (value in the red channel); `None` until the first simulation tick ran.
-    pub buffer: Option<wgpu::Buffer>,
-    /// Byte offset into the buffer (cubecl may give back a slice of a larger block).
-    pub offset: u64,
-    pub width: u32,
-    pub height: u32,
+    pub soil: VisBuffer,
+    pub water: VisBuffer,
+    /// Which of the above is currently displayed.
+    pub source: FieldVisSource,
     /// Target visualization texture (must be `Rgba32Float`).
     pub image: Handle<bevy::image::Image>,
-    /// Whether the visualization currently displays data from this buffer; the copy is
+    /// Whether the visualization currently displays data from a GPU buffer; the copy is
     /// skipped when false (e.g. when a CPU-resident field is shown instead).
     pub active: bool,
 }
@@ -103,10 +120,9 @@ pub struct FieldVisGpuData {
 impl Default for FieldVisGpuData {
     fn default() -> Self {
         Self {
-            buffer: None,
-            offset: 0,
-            width: 0,
-            height: 0,
+            soil: VisBuffer::default(),
+            water: VisBuffer::default(),
+            source: FieldVisSource::default(),
             image: Handle::default(),
             active: false,
         }
@@ -122,17 +138,24 @@ fn copy_field_vis_to_texture(
     render_queue: Res<RenderQueue>,
 ) {
     let Some(data) = data else { return };
-    if !data.active || data.width == 0 || data.height == 0 {
+    if !data.active {
         return;
     }
-    let Some(buffer) = &data.buffer else { return };
+    let src = match data.source {
+        FieldVisSource::Soil => &data.soil,
+        FieldVisSource::Water => &data.water,
+    };
+    if src.width == 0 || src.height == 0 {
+        return;
+    }
+    let Some(buffer) = &src.buffer else { return };
     let Some(gpu_image) = images.get(&data.image) else { return };
     if gpu_image.texture_descriptor.format != TextureFormat::Rgba32Float {
         return;
     }
 
     // 4 f32 per texel.
-    let bytes_per_row = (data.width * core::mem::size_of::<f32>() as u32 * 4).max(256);
+    let bytes_per_row = (src.width * core::mem::size_of::<f32>() as u32 * 4).max(256);
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("field_vis_tick_to_texture"),
     });
@@ -140,7 +163,7 @@ fn copy_field_vis_to_texture(
         TexelCopyBufferInfo {
             buffer,
             layout: TexelCopyBufferLayout {
-                offset: data.offset,
+                offset: src.offset,
                 bytes_per_row: Some(bytes_per_row),
                 rows_per_image: None,
             },
@@ -152,8 +175,8 @@ fn copy_field_vis_to_texture(
             aspect: TextureAspect::All,
         },
         Extent3d {
-            width: data.width,
-            height: data.height,
+            width: src.width,
+            height: src.height,
             depth_or_array_layers: 1,
         },
     );

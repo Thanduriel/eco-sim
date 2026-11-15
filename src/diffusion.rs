@@ -167,10 +167,10 @@ pub fn run_cubecl(
         )
         .expect("cubecl buffer should still be alive");
     let resource = managed.resource();
-    field_vis_gpu.buffer = Some(resource.buffer.clone());
-    field_vis_gpu.offset = resource.offset;
-    field_vis_gpu.width = gpu_bufs.size_x as u32;
-    field_vis_gpu.height = gpu_bufs.size_y as u32;
+    field_vis_gpu.soil.buffer = Some(resource.buffer.clone());
+    field_vis_gpu.soil.offset = resource.offset;
+    field_vis_gpu.soil.width = gpu_bufs.size_x as u32;
+    field_vis_gpu.soil.height = gpu_bufs.size_y as u32;
     if field_vis_gpu.image != terrain_assets.field_vis_image {
         field_vis_gpu.image = terrain_assets.field_vis_image.clone();
     }
