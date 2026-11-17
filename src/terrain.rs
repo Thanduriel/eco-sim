@@ -28,6 +28,9 @@ pub struct TerrainAssets {
     pub field_vis_image: Handle<Image>,
     /// Colormap LUT (256 x 1, linear) sampled by the field visualization shader.
     pub color_lut_image: Handle<Image>,
+    /// Rgba32Float texture holding the per-cell water surface stream
+    /// `[surface_height, depth, 0, 0]` (Phase 3 rendering; GPU-only copies).
+    pub water_surface_image: Handle<Image>,
 }
 
 /// Whether a field is defined on grid *vertices* (point values, interpolated smoothly
@@ -404,6 +407,20 @@ pub fn setup_terrain(
     );
     field_vis_image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::nearest());
     terrain_assets.field_vis_image = images.add(field_vis_image);
+
+    // Phase 3: water surface texture (256x256 = the splat cell grid; 0.25 m cells).
+    let mut water_surface_image = Image::new_uninit(
+        Extent3d {
+            width: 256,
+            height: 256,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        TextureFormat::Rgba32Float,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+    );
+    water_surface_image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::nearest());
+    terrain_assets.water_surface_image = images.add(water_surface_image);
 
     // Colormap LUT sampled by the shader (linear space to match `color_map::ColorMap`).
     terrain_assets.color_lut_image = images.add(build_field_color_lut());

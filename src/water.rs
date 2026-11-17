@@ -56,6 +56,12 @@ pub struct WaterParticles {
     pub cells_y: usize,
     pub cells_z: usize,
     pub cell_inv: f32,
+    /// Phase 3 surface: per-cell max particle height, encoded as `mm * 1000` in `u32`
+    /// (`fetch_max`, integer atomics) ...
+    pub surface_max: Handle,
+    /// ... converted into `Rgba32Float` texels `[surface_height, depth, 0, 0]` where
+    /// depth = surface - bilinear terrain height at the cell center.
+    pub surface: Handle,
     /// Debug splat: per-cell particle count (`u32`, atomics) ...
     pub splat_counts: Handle,
     /// ... converted into an `Rgba32Float` texel stream for the field overlay
@@ -374,35 +380,110 @@ fn compute_density<F: Float + LaunchArg, I: Int + LaunchArg>(
         // adding ghost masses (which double-count) and preserves the EoS compression
         // signal (unlike Shepard renormalization).
         let d = if tx > 1 {
-            // Terrain height at (xi, zi) via bilinear sampling (same as the contact).
+            // Distance to the terrain SURFACE (local boundary model): for every terrain
+            // cell within the support radius (2h; the radius scales with the grid
+            // spacing, capped at 3 cells), the foot point is the bilinear surface point
+            // at the particle's (x, z) clamped into that cell, and the distance is taken
+            // AT THE CELL'S TANGENT PLANE (exact for the local bilinear patch at any
+            // slope). The minimum over the neighborhood is the wall distance.
+            //
+            // The former (y - b) VERTICAL distance is exact only for a flat floor:
+            // under/beside a steep face it collapses to ~0, so c(q0) -> 0.5 doubles the
+            // density and the Tait EoS explodes the fluid (production max_surf 31 m).
+            // The tangent-plane distance is the correct measure on cliffs, ridges and
+            // any future heightfield feature; it also handles particles inside the
+            // terrain (buried: returns the perpendicular burial depth, bounded).
             let th = domain / F::cast_from(tx as f32);
             let fx = xi / th;
             let fz = zi / th;
-            let frac_x = clamp(fx - fx.floor(), F::new(0.0_f32), F::new(1.0_f32));
-            let frac_z = clamp(fz - fz.floor(), F::new(0.0_f32), F::new(1.0_f32));
-            let x0 = usize::cast_from(clamp(fx, F::new(0.0_f32), F::cast_from((tx - 1) as f32)));
-            let x1 = usize::cast_from(clamp(
-                fx + F::new(1.0_f32),
-                F::new(0.0_f32),
-                F::cast_from((tx - 1) as f32),
-            ));
-            let z0 = usize::cast_from(clamp(fz, F::new(0.0_f32), F::cast_from((ty - 1) as f32)));
-            let z1 = usize::cast_from(clamp(
-                fz + F::new(1.0_f32),
-                F::new(0.0_f32),
-                F::cast_from((ty - 1) as f32),
-            ));
-            let b00 = terrain[x0 + z0 * tx];
-            let b10 = terrain[x1 + z0 * tx];
-            let b01 = terrain[x0 + z1 * tx];
-            let b11 = terrain[x1 + z1 * tx];
-            let b = b00 * (F::new(1.0_f32) - frac_x) * (F::new(1.0_f32) - frac_z)
-                + b10 * frac_x * (F::new(1.0_f32) - frac_z)
-                + b01 * (F::new(1.0_f32) - frac_x) * frac_z
-                + b11 * frac_x * frac_z;
-            (yi - b).max(F::new(0.001_f32))
+            let rad = usize::cast_from(
+                (F::new(2.0_f32) * h / th).ceil().min(F::new(3.0_f32)),
+            );
+            let one = F::new(1.0_f32);
+            let xm = usize::cast_from(clamp(fx, F::new(0.0_f32), F::cast_from((tx - 1) as f32)));
+            let zm = usize::cast_from(clamp(fz, F::new(0.0_f32), F::cast_from((ty - 1) as f32)));
+            let mut best = F::new(1e10_f32);
+            for kz in 0..(rad + rad + 1usize) {
+                for kx in 0..(rad + rad + 1usize) {
+                    let xid = xm + kx;
+                    let cxx = (if kx <= rad {
+                        if xid >= rad {
+                            xid - rad
+                        } else {
+                            0usize
+                        }
+                    } else {
+                        xid - rad
+                    })
+                    .min(tx - 1usize);
+                    let zid = zm + kz;
+                    let czz = (if kz <= rad {
+                        if zid >= rad {
+                            zid - rad
+                        } else {
+                            0usize
+                        }
+                    } else {
+                        zid - rad
+                    })
+                    .min(ty - 1usize);
+                    let u = clamp(
+                        fx - F::cast_from(cxx as f32),
+                        F::new(0.0_f32),
+                        F::new(1.0_f32),
+                    );
+                    let v = clamp(
+                        fz - F::cast_from(czz as f32),
+                        F::new(0.0_f32),
+                        F::new(1.0_f32),
+                    );
+                    let xx1 = (cxx + 1usize).min(tx - 1usize);
+                    let zz1 = (czz + 1usize).min(ty - 1usize);
+                    let b00 = terrain[cxx + czz * tx];
+                    let b10 = terrain[xx1 + czz * tx];
+                    let b01 = terrain[cxx + zz1 * tx];
+                    let b11 = terrain[xx1 + zz1 * tx];
+                    let qy = b00 * (one - u) * (one - v)
+                        + b10 * u * (one - v)
+                        + b01 * (one - u) * v
+                        + b11 * u * v;
+                    let dx = xi - (F::cast_from(cxx as f32) + u) * th;
+                    let dy = yi - qy;
+                    let dz = zi - (F::cast_from(czz as f32) + v) * th;
+                    let gx = ((b10 - b00) * (one - v) + (b11 - b01) * v) / th;
+                    let gz = ((b01 - b00) * (one - u) + (b11 - b10) * u) / th;
+                    let nrm = (gx * gx + gz * gz + one).sqrt();
+                    if cxx == xm && czz == zm {
+                        // Own cell: perpendicular distance to the local tangent plane
+                        // (correct on steep faces: the vertical demo (y - b) is exact
+                        // only for a floor, and a neighbor plane would be chosen in a
+                        // CONCAVE wall interior where the extended rim plane cuts
+                        // through the fluid at an artificially small distance and
+                        // pumps the shore (the bowl-lake regression).
+                        let s = (dy - gx * dx - gz * dz) / nrm;
+                        let dk = if s < F::new(0.0_f32) { -s } else { s };
+                        best = best.min(dk);
+                    } else {
+                        // Neighbor cells: distance to the actual foot point on the
+                        // patch (no plane extension beyond its cell).
+                        let dk = (dx * dx + dy * dy + dz * dz).sqrt();
+                        best = best.min(dk);
+                    }
+                }
+            }
+            best.max(F::new(0.001_f32))
         } else {
             yi.max(F::new(0.001_f32))
+        };
+        // Closed-box world walls (periodic == 0) are boundaries too: the fluid pile
+        // against them has its kernel support truncated exactly like at the terrain,
+        // and without the renormalization it erupts (the production corner eruption).
+        // The planes are exact flat walls, so the distance to each is exact.
+        let d = if periodic == 0 {
+            let dw = xi.min(domain - xi).min(zi).min(domain - zi);
+            d.min(dw.max(F::new(0.001_f32)))
+        } else {
+            d
         };
         let q0 = (d / h).min(F::new(2.0_f32));
         // Closed-form support fraction (see the `halfspace_c` docs above).
@@ -791,21 +872,25 @@ fn integrate_half<F: Float + LaunchArg>(
             vz = vz * damp;
         }
     } else {
-    // World walls (closed box).
-    if x < F::new(0.0_f32) {
-        x = F::new(0.0_f32);
+    // World walls (closed box). The clamp uses the SAME stand-off as the periodic
+    // floor: a layer resting exactly ON the wall plane (z = domain_size) has its
+    // renormalization distance collapse to d = 0 -> c(0) = 0.5 -> density x2 -> EoS
+    // eruption of the pile (measured rho 1.5 rho0, p ~ 1 MPa at the corner).
+    let floor_rest = F::new(0.5_f32) * (h / F::new(1.3_f32));
+    if x < floor_rest {
+        x = floor_rest;
         vx = F::new(0.0_f32);
     }
-    if x > domain_size {
-        x = domain_size;
+    if x > domain_size - floor_rest {
+        x = domain_size - floor_rest;
         vx = F::new(0.0_f32);
     }
-    if z < F::new(0.0_f32) {
-        z = F::new(0.0_f32);
+    if z < floor_rest {
+        z = floor_rest;
         vz = F::new(0.0_f32);
     }
-    if z > domain_size {
-        z = domain_size;
+    if z > domain_size - floor_rest {
+        z = domain_size - floor_rest;
         vz = F::new(0.0_f32);
     }
 
@@ -852,19 +937,34 @@ fn integrate_half<F: Float + LaunchArg>(
         let ny = F::new(1.0_f32) / n_mag;
         let nz = nz / n_mag;
 
-        // Penetration push along the normal (horizontal for steep walls, so particles
-        // are never teleported on top of a vertical face). Capped per step to avoid
-        // explosive kicks out of deep penetrations.
-        let push = pen.min(F::new(0.1_f32));
-        x = x + push * nx;
-        y = y + push * ny;
-        z = z + push * nz;
+        // SHALLOW penetration: push along the normal at up to 0.1 m/step (fast
+        // absorption of slamming/compression; normal transient penetrations stay far
+        // below that) and reflect the normal velocity.
+        //
+        // DEEP burial (pen >= 2 particle spacings -- e.g. water spawned or terrain
+        // edited into the solid): RESCUE straight up to the local surface with zero
+        // vertical velocity. Capped-normal pushes make buried particles swim through
+        // the fluid at up to 24 m/s (0.1 m/step displacement cap) and a full normal
+        // projection can deposit them INSIDE the pool (overlap shock -> 139 m/s); the
+        // rescue reassembles them on the surface, where they fall/slide back into the
+        // fluid. (A vertical-only push stays wrong ONLY for shallow penetration:
+        // sliding particles would pop on top of steep faces -- hence the two regimes.)
+        let deep = F::new(2.0_f32) * (h / F::new(1.3_f32));
+        if pen > deep {
+            y = b + F::new(0.5_f32) * (h / F::new(1.3_f32));
+            vy = F::new(0.0_f32);
+        } else {
+            let push = pen.min(F::new(0.1_f32));
+            x = x + push * nx;
+            y = y + push * ny;
+            z = z + push * nz;
 
-        let vn = vx * nx + vy * ny + vz * nz;
-        if vn < F::new(0.0_f32) {
-            vx = vx - vn * nx;
-            vy = vy - vn * ny;
-            vz = vz - vn * nz;
+            let vn = vx * nx + vy * ny + vz * nz;
+            if vn < F::new(0.0_f32) {
+                vx = vx - vn * nx;
+                vy = vy - vn * ny;
+                vz = vz - vn * nz;
+            }
         }
         let damp = (F::new(1.0_f32) - friction * dt).max(F::new(0.0_f32));
         vx = vx * damp;
@@ -972,6 +1072,111 @@ fn counts_to_texels<I: Int + LaunchArg, F: Float + LaunchArg>(
     );
     texels[p] = v;
     texels[p + 1] = F::new(0.0_f32);
+    texels[p + 2] = F::new(0.0_f32);
+    texels[p + 3] = F::new(0.0_f32);
+}
+
+/// Phase 3 surface kernels: per-cell maximum particle height on a 2D cell grid.
+///
+/// Height is encoded as `u32(f32::min(y, ...) * 1000)` (mm resolution) so the atomic
+/// max can use integer atomics (float atomics are rejected by naga/wgpu-30).
+#[cube(launch_unchecked)]
+fn surface_clear<I: Int + LaunchArg>(maxes: &mut [I], n: usize) {
+    let i = ABSOLUTE_POS_X as usize;
+    if i < n {
+        maxes[i] = I::new(0);
+    }
+}
+
+#[cube(launch_unchecked)]
+fn particle_to_surface<F: Float + LaunchArg, I: Int + LaunchArg>(
+    pos: &[F],
+    maxes: &[Atomic<I>],
+    domain_size: F,
+    cells: usize,
+    num: usize,
+) {
+    let i = ABSOLUTE_POS_X as usize;
+    if i >= num {
+        terminate!();
+    }
+    let p = i * 4;
+    let x = clamp(
+        pos[p] / domain_size * F::cast_from(cells as f32),
+        F::new(0.0_f32),
+        F::cast_from((cells - 1) as f32),
+    );
+    let z = clamp(
+        pos[p + 2] / domain_size * F::cast_from(cells as f32),
+        F::new(0.0_f32),
+        F::cast_from((cells - 1) as f32),
+    );
+    let cell = usize::cast_from(x) + usize::cast_from(z) * cells;
+    let enc = I::cast_from(pos[p + 1] * F::new(1000.0_f32));
+    maxes[cell].fetch_max(enc);
+}
+
+/// Decode the max heights and write `[surface, depth, 0, 0]` texels (depth vs the
+/// bilinear terrain height at each cell center).
+#[cube(launch_unchecked)]
+fn surface_to_texels<F: Float + LaunchArg, I: Int + LaunchArg>(
+    maxes: &[I],
+    terrain: &[F],
+    texels: &mut [F],
+    domain_size: F,
+    cells: usize,
+    tx: usize,
+    ty: usize,
+) {
+    let i = ABSOLUTE_POS_X as usize;
+    if i >= cells * cells {
+        terminate!();
+    }
+    let p = i * 4;
+    let cx = i % cells;
+    let cz = i / cells;
+    let surf = F::cast_from(maxes[i]) / F::new(1000.0_f32);
+    let cell_uv = (F::cast_from(cx as f32) + F::new(0.5_f32)) / F::cast_from(cells as f32);
+    let wx = cell_uv * domain_size;
+    let wz = (F::cast_from(cz as f32) + F::new(0.5_f32)) / F::cast_from(cells as f32) * domain_size;
+
+    let th = domain_size / F::cast_from(tx as f32);
+    let fx = wx / th;
+    let fz = wz / th;
+    let frac_x = clamp(fx - fx.floor(), F::new(0.0_f32), F::new(1.0_f32));
+    let frac_z = clamp(fz - fz.floor(), F::new(0.0_f32), F::new(1.0_f32));
+    let x0 = usize::cast_from(clamp(fx, F::new(0.0_f32), F::cast_from((tx - 1) as f32)));
+    let x1 = usize::cast_from(clamp(
+        fx + F::new(1.0_f32),
+        F::new(0.0_f32),
+        F::cast_from((tx - 1) as f32),
+    ));
+    let z0 = usize::cast_from(clamp(fz, F::new(0.0_f32), F::cast_from((ty - 1) as f32)));
+    let z1 = usize::cast_from(clamp(
+        fz + F::new(1.0_f32),
+        F::new(0.0_f32),
+        F::cast_from((ty - 1) as f32),
+    ));
+    let b00 = terrain[x0 + z0 * tx];
+    let b10 = terrain[x1 + z0 * tx];
+    let b01 = terrain[x0 + z1 * tx];
+    let b11 = terrain[x1 + z1 * tx];
+    let b = b00 * (F::new(1.0_f32) - frac_x) * (F::new(1.0_f32) - frac_z)
+        + b10 * frac_x * (F::new(1.0_f32) - frac_z)
+        + b01 * (F::new(1.0_f32) - frac_x) * frac_z
+        + b11 * frac_x * frac_z;
+
+    // Empty cells (no particle contributed: surf == 0) have NO water: depth must be 0,
+    // not `-terrain` (which would paint a fake sheet over below-zero terrain valleys).
+    // Depth is only meaningful where a particle actually touched the cell.
+    let is_water = if surf > F::new(0.0_f32) {
+        F::new(1.0_f32)
+    } else {
+        F::new(0.0_f32)
+    };
+    let depth = (surf - b).max(F::new(0.0_f32)) * is_water;
+    texels[p] = surf;
+    texels[p + 1] = depth;
     texels[p + 2] = F::new(0.0_f32);
     texels[p + 3] = F::new(0.0_f32);
 }
@@ -1296,7 +1501,25 @@ pub fn setup_water(
     let num = nx * ny * nz;
     let cx = crate::domain::CENTER.x;
     let cz = crate::domain::CENTER.y;
-    let base_y = 1.5;
+    // Float the blob above the LOCAL terrain: a fixed base_y can be below the ridge
+    // surface, where the half-space density correction sees d ~ 0 (c -> 0.5) and doubles
+    // the density -> Tait EoS explosion at startup (particles to 30+ m, then tunneling
+    // through the bed). Empirically the blob must rest above the footprint.
+    let mut base_y = 1.5;
+    {
+        let half = sx.max(sz) * 0.5;
+        let mut local_max = f32::MIN;
+        for iz in 0..=16 {
+            for ix in 0..=16 {
+                let p = Vec2::new(
+                    cx - half + 2.0 * half * ix as f32 / 16.0,
+                    cz - half + 2.0 * half * iz as f32 / 16.0,
+                );
+                local_max = local_max.max(terrain.height_map.get_bilinear(p));
+            }
+        }
+        base_y = local_max.max(base_y) + 0.5;
+    }
 
     let mut pos = Vec::with_capacity(num * 4);
     for y in 0..ny {
@@ -1335,10 +1558,9 @@ pub fn setup_water(
     client.write(&terrain_handle, bytes(&terrain.height_map.buffer));
 
     // Neighbor grid: cell size = SPH support (2h).
-    let h = s * params.smoothing_ratio;
-    let cell_size = 2.0 * h;
+    let cell_size = 2.0 * s * params.smoothing_ratio;
     let cells_x = (crate::domain::SIZE_F32.x / cell_size).ceil() as usize;
-    let cells_y = (params.max_particle_height / cell_size).ceil() as usize;
+    let cells_y = (crate::domain::SIZE_F32.y / cell_size).ceil() as usize;
     let cells_z = (crate::domain::SIZE_F32.y / cell_size).ceil() as usize;
     let cells = cells_x * cells_y * cells_z;
     let grid_counts = client.empty(cells * core::mem::size_of::<u32>());
@@ -1348,6 +1570,9 @@ pub fn setup_water(
     let splat_cells = 256usize;
     let splat_counts = client.empty(splat_cells * splat_cells * core::mem::size_of::<u32>());
     let splat = client.empty(splat_cells * splat_cells * 4 * core::mem::size_of::<f32>());
+    let surface_max = client.empty(splat_cells * splat_cells * core::mem::size_of::<u32>());
+    let surface =
+        client.empty(splat_cells * splat_cells * 4 * core::mem::size_of::<f32>());
 
     commands.insert_resource(WaterParticles {
         num,
@@ -1372,6 +1597,8 @@ pub fn setup_water(
         cell_inv: 1.0 / cell_size,
         splat_counts,
         splat,
+        surface_max,
+        surface,
         cells: splat_cells,
         current_is_b: false,
     });
@@ -1446,9 +1673,9 @@ pub fn run_water(
             crate::domain::SIZE_F32.x,
             0,
             1, // terrain-aware half-space density correction (bilinear height)
-            0.0,
+            wp.xsph,
             &p.rho_prev,
-            0.0,
+            wp.diffusion,
         );
         p.current_is_b = !use_b;
     }
@@ -1499,6 +1726,51 @@ pub fn run_water(
     if field_vis_gpu.image != terrain_assets.field_vis_image {
         field_vis_gpu.image = terrain_assets.field_vis_image.clone();
     }
+
+    // Phase 3 surface: clear the per-cell max, scatter particle heights (integer atomic
+    // max; the `cubecl::Atomic` only supports integer ops), decode to texels with the
+    // depth vs the terrain, and publish for the renderer (copied every frame by
+    // `gpu::copy_field_vis_to_texture`, independent of the F1/F3/F5 field selection).
+    unsafe {
+        surface_clear::launch_unchecked::<u32>(
+            client,
+            CubeCount::Static((p.cells * p.cells).div_ceil(dim as usize) as u32, 1, 1),
+            CubeDim::new_1d(dim),
+            BufferArg::from_raw_parts(p.surface_max.clone(), p.cells * p.cells),
+            p.cells * p.cells,
+        );
+        particle_to_surface::launch_unchecked::<f32, u32>(
+            client,
+            CubeCount::Static(p.num.div_ceil(dim as usize) as u32, 1, 1),
+            CubeDim::new_1d(dim),
+            BufferArg::from_raw_parts(cur_pos.clone(), p.num * 4),
+            BufferArg::from_raw_parts(p.surface_max.clone(), p.cells * p.cells),
+            crate::domain::SIZE_F32.x,
+            p.cells,
+            p.num,
+        );
+        surface_to_texels::launch_unchecked::<f32, u32>(
+            client,
+            CubeCount::Static((p.cells * p.cells).div_ceil(dim as usize) as u32, 1, 1),
+            CubeDim::new_1d(dim),
+            BufferArg::from_raw_parts(p.surface_max.clone(), p.cells * p.cells),
+            BufferArg::from_raw_parts(p.terrain.clone(), p.terrain_x * p.terrain_y),
+            BufferArg::from_raw_parts(p.surface.clone(), p.cells * p.cells * 4),
+            crate::domain::SIZE_F32.x,
+            p.cells,
+            p.terrain_x,
+            p.terrain_y,
+        );
+    }
+    let managed = client
+        .get_resource::<cubecl::wgpu::WgpuServer<cubecl::wgpu::AutoCompiler>>(p.surface.clone())
+        .expect("cubecl buffer should still be alive");
+    let resource = managed.resource();
+    field_vis_gpu.surface.buffer = Some(resource.buffer.clone());
+    field_vis_gpu.surface.offset = resource.offset;
+    field_vis_gpu.surface.width = p.cells as u32;
+    field_vis_gpu.surface.height = p.cells as u32;
+    field_vis_gpu.surface_image = terrain_assets.water_surface_image.clone();
 }
 
 #[cfg(test)]
@@ -1694,6 +1966,8 @@ mod tests {
                 cell_inv: 1.0,
                 splat_counts: self.grid_scan.clone(),
                 splat: self.grid_scan.clone(),
+                surface_max: self.grid_scan.clone(),
+                surface: self.grid_scan.clone(),
                 cells: 1,
                 current_is_b: self.use_b,
             };
@@ -1859,12 +2133,15 @@ mod tests {
         rig.step(dt, 4 * 60 * 2, 0.5);
 
         let pos = rig.read_current_pos();
+        // Wall stand-off (s/2 = h/2.6 with default h=1.3*spacing): resting exactly ON
+        // the wall plane makes the wall renormalization see d = 0 (c -> 0.5 -> x2 rho).
+        let rest = 0.25f32;
         assert!(pos[0] >= 0.0 && pos[0] <= 64.0, "x out of box: {:?}", pos);
         assert!(pos[2] >= 0.0 && pos[2] <= 64.0, "z out of box: {:?}", pos);
         assert!(pos[1] >= 0.0, "fell through floor: {:?}", pos);
         assert!(
-            (pos[0] - 0.0).abs() < 0.02 && (pos[2] - 64.0).abs() < 0.02,
-            "should rest against the walls: {:?}",
+            (pos[0] - rest).abs() < 0.02 && (pos[2] - (64.0 - rest)).abs() < 0.02,
+            "should rest at the wall stand-off: {:?}",
             pos
         );
     }
@@ -2070,6 +2347,97 @@ mod tests {
         assert!(
             max_speed < 0.3,
             "lake not at rest: max |v|={max_speed}"
+        );
+    }
+
+    /// Steep-slope boundary stability (production requirement): a near-vertical ridge
+    /// wall (the discrete bilinear face rises 3 m over one 1 m cell ~ 71.6deg) with a
+    /// water blob at its foot on a flat floor. The old VERTICAL-distance density
+    /// correction (y - b) is exact only for a floor: under/beside the steep face it
+    /// collapses to ~0, c(q0) -> 0.5 doubles the density and the Tait EoS explodes the
+    /// fluid. The surface-distance (closest tangent-plane) correction must keep the sim
+    /// bounded: no explosion, no tunneling below the floor or through the ridge.
+    #[test]
+    fn steep_ridge_slope_stability() {
+        run_on_all_backends(steep_ridge_stability_impl);
+    }
+
+    fn steep_ridge_stability_impl(client: &Client) {
+        let spacing = 0.5;
+        let gx = 64usize; // 1 m cells (production resolution), domain 64 m
+        let mut terrain = vec![0.0f32; gx * gx];
+        for j in 0..gx {
+            for i in 0..gx {
+                let x = i as f32;
+                let h = if x > 32.0 { ((x - 32.0) * 3.0).min(3.0) } else { 0.0 };
+                terrain[i + j * gx] = h;
+            }
+        }
+        // Blob from the box wall to AND overlapping the steep face (x in [0.25, 35]):
+        // the x > 32 columns start INSIDE the ridge (b = 0..3 m above their y) — the
+        // production failure geometry for the vertical distance (d -> 0, c -> 0.5) —
+        // and the left end piles against the box wall (hard clamp without a stand-off
+        // used to collapsec the wall renormalization distance to 0 -> density x2 ->
+        // pile eruption). The surface-distance correction + wall stand-off must keep
+        // it bounded.
+        let mut pos = Vec::new();
+        for z in 0..6usize {
+            for x in 0..22usize {
+                for y in 0..4usize {
+                    pos.push(0.25 + x as f32 * spacing);
+                    pos.push(spacing * 0.5 + y as f32 * spacing);
+                    pos.push(30.0 + z as f32 * spacing);
+                    pos.push(0.0);
+                }
+            }
+        }
+        let mut rig = Rig::new_with_client(client.clone(), &pos, &terrain, gx, gx);
+        rig.periodic = 0; // closed box + terrain (production-like)
+        rig.floor_ghosts = 1;
+        rig.domain = 64.0;
+        rig.gravity = GRAVITY;
+        rig.friction = 5.0;
+        rig.sound_speed = 40.0;
+        rig.xsph = 0.0;
+        rig.diffusion = 0.0;
+        rig.alpha = 0.3;
+        rig.h_ratio = 1.3;
+        let dt = 1.0 / 240.0;
+        rig.step(dt, 1500, spacing);
+
+        let vel = rig.read_current_vel();
+        let max_speed = vel
+            .chunks_exact(4)
+            .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
+            .fold(0.0f32, f32::max);
+        let cur = rig.read_current_pos();
+        let mut min_y = f32::MAX;
+        let mut worst_burial = f32::MIN;
+        for v in cur.chunks_exact(4) {
+            min_y = min_y.min(v[1]);
+            // Terrain height at the particle (bilinear, 1 m grid).
+            let fx = v[0].min(63.0);
+            let fz = v[2].min(63.0);
+            let x0 = fx as usize;
+            let z0 = fz as usize;
+            let (x1, z1) = ((x0 + 1).min(63), (z0 + 1).min(63));
+            let u = fx - x0 as f32;
+            let w = fz - z0 as f32;
+            let b = terrain[x0 + z0 * gx] * (1.0 - u) * (1.0 - w) + terrain[x1 + z0 * gx] * u * (1.0 - w)
+                + terrain[x0 + z1 * gx] * (1.0 - u) * w + terrain[x1 + z1 * gx] * u * w;
+            worst_burial = worst_burial.max(b - v[1]);
+        }
+        println!(
+            "steep ridge: max |v| {max_speed:.3}, min_y {min_y:.2}, worst burial {worst_burial:.2}"
+        );
+        assert!(
+            max_speed < 2.0,
+            "steep-face explosion: max |v|={max_speed}"
+        );
+        assert!(min_y > -0.5, "tunneled below the floor (min y {min_y})");
+        assert!(
+            worst_burial < 0.3,
+            "water still buried inside the terrain (worst burial {worst_burial:.2})"
         );
     }
 
@@ -2441,6 +2809,8 @@ mod tests {
             cell_inv,
             splat_counts: pos_h.clone(),
             splat: pos_h.clone(),
+            surface_max: pos_h.clone(),
+            surface: pos_h.clone(),
             cells: 1,
             current_is_b: false,
         };

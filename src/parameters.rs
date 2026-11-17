@@ -90,7 +90,14 @@ pub struct WaterParameters {
     pub fluid_density: f32,
     /// SPH: reference sound speed c0 (m/s); the Tait exponent gamma is implied by
     /// `p = B((rho/rho0)^gamma - 1)` with `B = rho0 c0^2 / gamma`.
+    /// Calibrated with the analytic battery: c0 = 40 (c0 = 20 amplifies the drop-slam
+    /// of the initial blob into an eruption on rugged terrain).
     pub sound_speed: f32,
+    /// SPH: velocity smoothing used inside the half-step integrator (stabilizes the
+    /// slosh; 0 = plain WCSPH). Test-validated value 0.2.
+    pub xsph: f32,
+    /// SPH: delta-SPH density diffusion coefficient (0 = off). Test-validated 0.0.
+    pub diffusion: f32,
     /// SPH: Tait exponent gamma.
     pub gamma: f32,
     /// SPH: Monaghan artificial viscosity coefficient alpha.
@@ -101,6 +108,11 @@ pub struct WaterParameters {
     pub smoothing_ratio: f32,
     /// Grid extent in y used for the neighbor cells (particles above this are invalid).
     pub max_particle_height: f32,
+    /// Phase 3 rendering: water depth (m) at which the surface color saturates to "deep".
+    pub surface_depth_scale: f32,
+    /// Phase 3 rendering: water depth (m) at which the surface alpha saturates (shoreline
+    /// transparency).
+    pub surface_alpha_scale: f32,
 }
 
 impl Default for WaterParameters {
@@ -113,12 +125,16 @@ impl Default for WaterParameters {
             debug_count_scale: 4.0,
             terrain_friction: 3.0,
             fluid_density: 1000.0,
-            sound_speed: 20.0,
+            sound_speed: 40.0,
             gamma: 7.0,
-            viscosity_alpha: 0.1,
+            viscosity_alpha: 0.3,
+            xsph: 0.2,
+            diffusion: 0.0,
             stiffness_clamp: 0.1,
             smoothing_ratio: 1.3,
             max_particle_height: 8.0,
+            surface_depth_scale: 4.0,
+            surface_alpha_scale: 1.0,
         }
     }
 }

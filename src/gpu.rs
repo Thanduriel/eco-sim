@@ -115,6 +115,11 @@ pub struct FieldVisGpuData {
     /// Whether the visualization currently displays data from a GPU buffer; the copy is
     /// skipped when false (e.g. when a CPU-resident field is shown instead).
     pub active: bool,
+    /// Phase 3: per-cell water surface stream `[surface_height, depth, 0, 0]` (texels), copied
+    /// into `surface_image` every frame regardless of the F1/F3/F5 field selection.
+    pub surface: VisBuffer,
+    /// Target texture for the water surface (Rgba32Float, e.g. 256x256).
+    pub surface_image: Handle<bevy::image::Image>,
 }
 
 impl Default for FieldVisGpuData {
@@ -125,6 +130,8 @@ impl Default for FieldVisGpuData {
             source: FieldVisSource::default(),
             image: Handle::default(),
             active: false,
+            surface: VisBuffer::default(),
+            surface_image: Handle::default(),
         }
     }
 }
@@ -138,6 +145,52 @@ fn copy_field_vis_to_texture(
     render_queue: Res<RenderQueue>,
 ) {
     let Some(data) = data else { return };
+
+    // Phase 3: ALWAYS-copied water surface stream — MUST run before the field-vis
+    // early-outs below. The `active` flag tracks the F1/F3/F5 field overlay; gating the
+    // surface copy on it froze the water texture when the overlay was off (the plane
+    // showed one stale frame: static, uniform, unresponsive to the surface tunables).
+    let Some(surface_image) = images.get(&data.surface_image) else {
+        return;
+    };
+    if surface_image.texture_descriptor.format != TextureFormat::Rgba32Float {
+        return;
+    }
+    if data.surface.width == 0 || data.surface.height == 0 {
+        return;
+    }
+    let Some(surface_buffer) = &data.surface.buffer else {
+        return;
+    };
+    let surface_bpr = (data.surface.width * core::mem::size_of::<f32>() as u32 * 4).max(256);
+    let mut surf_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("water_surface_to_texture"),
+    });
+    surf_encoder.copy_buffer_to_texture(
+        TexelCopyBufferInfo {
+            buffer: surface_buffer,
+            layout: TexelCopyBufferLayout {
+                offset: data.surface.offset,
+                bytes_per_row: Some(surface_bpr),
+                rows_per_image: None,
+            },
+        },
+        TexelCopyTextureInfo {
+            texture: &surface_image.texture,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        Extent3d {
+            width: data.surface.width,
+            height: data.surface.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let surf_cmd = surf_encoder.finish();
+    render_queue.submit(Some(surf_cmd));
+
+    // Field-vis stream (F1/F3/F5 overlay), gated by the overlay state.
     if !data.active {
         return;
     }
@@ -153,8 +206,6 @@ fn copy_field_vis_to_texture(
     if gpu_image.texture_descriptor.format != TextureFormat::Rgba32Float {
         return;
     }
-
-
     // 4 f32 per texel.
     let bytes_per_row = (src.width * core::mem::size_of::<f32>() as u32 * 4).max(256);
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
