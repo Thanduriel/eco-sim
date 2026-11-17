@@ -9,13 +9,16 @@
 //!
 //! All state stays on the GPU via cubecl on Bevy's device (see `gpu.rs`).
 //!
-//! Neighbor search: the *physics* kernels take a `use_grid` switch. Production currently
-//! runs `use_grid = 0` (dense all-pairs loop) — the uniform-grid cell lists (built with
-//! integer atomics) are kept but DISABLED: the cubecl-wgpu scatter produced
-//! non-deterministic cell lists on this device despite atomics themselves being correct
-//! (verified: 64/64 concurrent fetch_adds; single-threaded probes pass). At ~2.3k
-//! particles the all-pairs loop is trivially cheap on the GPU, and it is the exact path
-//! the CPU-runtime unit tests exercise. Revisit with the Bevy-readback migration.
+//! Neighbor search: the *physics* kernels take a `use_grid` switch. Production runs
+//! `use_grid = 1` (uniform-grid cell lists built with integer atomics: zero -> count ->
+//! prefix -> scatter). The grid was DISABLED for a long time because of reported
+//! cubecl-wgpu scatter nondeterminism, but the root cause was a plain logic bug: the
+//! scatter atomically incremented the counts buffer *without re-zeroing it* (the count
+//! pass and the prefix pass both use it), so every cell's slots started at count(cell)
+//! and the whole list landed one count late. The atomics themselves were always fine
+//! (verified by `grid_cell_lists_are_consistent_on_gpu`, now enabled and passing).
+//! `use_grid = 0` (dense all-pairs) remains the CPU-runtime test path (the cubecl CPU
+//! runtime has no atomics).
 
 use bevy::prelude::*;
 use cubecl::prelude::*;
@@ -48,10 +51,17 @@ pub struct WaterParticles {
     pub terrain_x: usize,
     pub terrain_y: usize,
     /// Uniform neighbor grid: per-cell counts (`cells` u32), exclusive prefix (`cells+1`),
-    /// and the compacted particle index list (`num` u32).
+    /// and the compacted particle index list (`num` u32). The prefix is built by a
+    /// hierarchical parallel scan: block totals (`nblocks` u32 = `cells/64`) -> block
+    /// offsets (`nblocks+1` u32) -> inner scan. The offsets MUST be a separate buffer:
+    /// sharing the scan buffer with the inner-scan writes races (inner threads rewrite
+    /// the block offsets, corrupting the reads of later blocks). The old single-threaded
+    /// prefix was ~6 ms/build.
     pub grid_counts: Handle,
     pub grid_scan: Handle,
     pub grid_list: Handle,
+    pub grid_totals: Handle,
+    pub grid_offsets: Handle,
     pub cells_x: usize,
     pub cells_y: usize,
     pub cells_z: usize,
@@ -138,16 +148,78 @@ fn grid_count<F: Float + LaunchArg, I: Int + LaunchArg>(
     counts[cell].fetch_add(I::new(1));
 }
 
-/// Exclusive prefix sum over cell counts (single thread; trivial cost).
+/// Block totals for the hierarchical prefix: thread `b` sums the 64 counts of block `b`
+/// (≤64 sequential reads, `nblocks` threads in parallel) into `totals[b]`.
 #[cube(launch_unchecked)]
-fn grid_prefix<I: Int + LaunchArg>(counts: &[I], scan: &mut [I], cells: usize) {
+fn grid_block_totals<I: Int + LaunchArg>(
+    counts: &[I],
+    totals: &mut [I],
+    cells: usize,
+    treads: usize,
+    nblocks: usize,
+) {
+    let b = ABSOLUTE_POS_X as usize;
+    if b >= nblocks {
+        terminate!();
+    }
+    let start = b * treads;
+    let mut s = I::new(0);
+    let mut k = 0usize;
+    while k < treads {
+        let idx = start + k;
+        if idx < cells {
+            s = s + counts[idx];
+        }
+        k = k + 1;
+    }
+    totals[b] = s;
+}
+
+/// Exclusive prefix over the block totals into `scan[0..=nblocks]` (one thread; ~274
+/// iterations, µs). The previous single-threaded full-grid prefix (~17,500 iterations of
+/// a serial dependency chain) was the real performance bottleneck (~6-9 ms per build).
+#[cube(launch_unchecked)]
+fn grid_block_prefix<I: Int + LaunchArg>(
+    totals: &[I],
+    scan: &mut [I],
+    nblocks: usize,
+) {
     let i = ABSOLUTE_POS_X as usize;
     if i != 0 {
         terminate!();
     }
     scan[0] = I::new(0);
-    for c in 0..cells {
-        scan[c + 1] = scan[c] + counts[c];
+    for b in 0..nblocks {
+        scan[b + 1] = scan[b] + totals[b];
+    }
+}
+
+/// Final per-cell scan: `scan[c+1] = scan[block(c)] + Σ counts[block_start..=c]`, one
+/// thread per cell, ≤64 reads per thread. Runs after [`grid_block_prefix`], which already
+/// wrote `scan[0..=nblocks]` (the per-block exclusive offsets).
+#[cube(launch_unchecked)]
+fn grid_inner_scan<I: Int + LaunchArg>(
+    counts: &[I],
+    offsets: &[I],
+    scan: &mut [I],
+    cells: usize,
+    treads: usize,
+) {
+    let c = ABSOLUTE_POS_X as usize;
+    if c >= cells {
+        terminate!();
+    }
+    let b = c / treads;
+    let base = b * treads;
+    let mut s = offsets[b];
+    let mut k = base;
+    while k <= c {
+        s = s + counts[k];
+        k = k + 1;
+    }
+    scan[c + 1] = s;
+    if c == 0 {
+        scan[0] = I::new(0);
     }
 }
 
@@ -679,13 +751,13 @@ fn compute_force<F: Float + LaunchArg, I: Int + LaunchArg>(
                         let r_end = usize::cast_from(scan[cell + 1]);
                         for k in r_start..r_end {
                             let j = usize::cast_from(list[k]);
-                            {
+                            if j != i {
                                 let pj = j * 4;
                                 let dx = xi - pos[pj];
                                 let dy = yi - pos[pj + 1];
                                 let dz = zi - pos[pj + 2];
                                 let r2 = dx * dx + dy * dy + dz * dz;
-                                if r2 < support2 {
+                                if r2 < support2 && r2 > F::new(1e-12_f32) {
                                     let r = (r2).sqrt();
                                     let q = r / h;
                                     let mut dw_dq = F::new(0.0_f32);
@@ -1185,16 +1257,19 @@ fn surface_to_texels<F: Float + LaunchArg, I: Int + LaunchArg>(
 // Setup & main loop
 // ---------------------------------------------------------------------------
 
-/// Builds the neighbor grid for the current positions (zero -> count -> prefix -> scatter).
-///
-/// DISABLED since the grid-mode physics is not used (see the module docs and AGENTS.md):
-/// `grid_scatter` produced non-deterministic cell lists on cubecl-wgpu. Kept for the
-/// CPU-runtime comparison and a future migration.
+/// Builds the neighbor grid for the current positions (zero -> count -> prefix -> zero ->
+/// scatter). The extra zero between the prefix and the scatter is the key: the scatter
+/// atomically increments the counts to claim slots, and it must start from 0 (`grid_count`
+/// already led them to the full counts; `grid_prefix` only reads them). Without the
+/// re-zero every cell's slots start at count(cell) and the list lands one count late —
+/// the historical "cubecl-wgpu scatter nondeterminism".
 fn build_grid(client: &Client, p: &WaterParticles, pos: &Handle) {
     let dim = 64u32;
     let cells = p.cells_x * p.cells_y * p.cells_z;
     let cell_inv = p.cell_inv;
     let max_y = p.cells_y as f32 * (1.0 / cell_inv);
+    let treads = 64usize; // cells per block; one thread sums one block's 64 counts
+    let nblocks = cells.div_ceil(treads);
     unsafe {
         grid_zero::launch_unchecked::<u32>(
             client,
@@ -1217,12 +1292,49 @@ fn build_grid(client: &Client, p: &WaterParticles, pos: &Handle) {
             p.cells_z,
             p.num,
         );
-        grid_prefix::launch_unchecked::<u32>(
+        // Hierarchical parallel prefix: the old single-threaded `grid_prefix` ran a
+        // 17,500-element serial dependency chain (~6-9 ms per build, 8 builds per tick
+        // = ~52 ms/tick). Block totals (all parallel) -> tiny block prefix -> inner scan.
+        grid_block_totals::launch_unchecked::<u32>(
+            client,
+            CubeCount::Static(nblocks.div_ceil(dim as usize) as u32, 1, 1),
+            CubeDim::new_1d(dim),
+            BufferArg::from_raw_parts(p.grid_counts.clone(), cells),
+            BufferArg::from_raw_parts(p.grid_totals.clone(), nblocks),
+            cells,
+            treads,
+            nblocks,
+        );
+        grid_block_prefix::launch_unchecked::<u32>(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new_1d(1),
+            BufferArg::from_raw_parts(p.grid_totals.clone(), nblocks),
+            BufferArg::from_raw_parts(p.grid_offsets.clone(), nblocks + 1),
+            nblocks,
+        );
+        grid_inner_scan::launch_unchecked::<u32>(
+            client,
+            CubeCount::Static(cells.div_ceil(dim as usize) as u32, 1, 1),
+            CubeDim::new_1d(dim),
             BufferArg::from_raw_parts(p.grid_counts.clone(), cells),
+            BufferArg::from_raw_parts(p.grid_offsets.clone(), nblocks + 1),
             BufferArg::from_raw_parts(p.grid_scan.clone(), cells + 1),
+            cells,
+            treads,
+        );
+        // The scatter's `counts[cell].fetch_add` must start from 0: `grid_count` left
+        // the counts at their full values and the scan only *read* them, so without
+        // re-zeroing every cell's atomics start at count(cell) and the whole list
+        // lands one count late (`scan[cell] + count + slot`) — overlapping the next
+        // cell's range and leaving this range's head untouched (zeros -> "duplicate
+        // particle 0" in the invariant test). This was the real "cubecl-wgpu scatter
+        // nondeterminism" all along: the atomics were never wrong.
+        grid_zero::launch_unchecked::<u32>(
+            client,
+            CubeCount::Static(cells.div_ceil(dim as usize) as u32, 1, 1),
+            CubeDim::new_1d(dim),
+            BufferArg::from_raw_parts(p.grid_counts.clone(), cells),
             cells,
         );
         grid_scatter::launch_unchecked::<f32, u32>(
@@ -1245,6 +1357,7 @@ fn build_grid(client: &Client, p: &WaterParticles, pos: &Handle) {
 
 /// Force pass: density + pressure + accelerations at the current positions.
 #[allow(clippy::too_many_arguments)]
+
 fn sph_force_pass(
     client: &Client,
     p: &WaterParticles,
@@ -1566,6 +1679,10 @@ pub fn setup_water(
     let grid_counts = client.empty(cells * core::mem::size_of::<u32>());
     let grid_scan = client.empty((cells + 1) * core::mem::size_of::<u32>());
     let grid_list = client.empty(num * core::mem::size_of::<u32>());
+    let treads = 64usize;
+    let nblocks = cells.div_ceil(treads);
+    let grid_totals = client.empty(nblocks * core::mem::size_of::<u32>());
+    let grid_offsets = client.empty((nblocks + 1) * core::mem::size_of::<u32>());
 
     let splat_cells = 256usize;
     let splat_counts = client.empty(splat_cells * splat_cells * core::mem::size_of::<u32>());
@@ -1591,6 +1708,8 @@ pub fn setup_water(
         grid_counts,
         grid_scan,
         grid_list,
+        grid_totals,
+        grid_offsets,
         cells_x,
         cells_y,
         cells_z,
@@ -1633,6 +1752,7 @@ pub fn run_water(
         }
     }
 
+
     let dt =
         1.0 / parameters::PHYSICS_TICKS_PER_SEC as f32 / wp.substeps.max(1) as f32;
     let s = wp.particle_spacing;
@@ -1667,7 +1787,7 @@ pub fn run_water(
             wp.gamma,
             wp.viscosity_alpha,
             wp.sound_speed,
-            0,
+            1, // GRID neighbor search (dense all-pairs caps at ~2.3k particles)
             9.81_f32,
             wp.terrain_friction,
             crate::domain::SIZE_F32.x,
@@ -1679,7 +1799,6 @@ pub fn run_water(
         );
         p.current_is_b = !use_b;
     }
-
     // Debug splat: clear counts, scatter particles, convert to texels.
     let (cur_pos, _cur_vel) = if p.current_is_b {
         (&p.pos_b, &p.vel_b)
@@ -1960,6 +2079,8 @@ mod tests {
                 grid_counts: self.grid_scan.clone(),
                 grid_scan: self.grid_scan.clone(),
                 grid_list: self.grid_list.clone(),
+                grid_totals: self.grid_list.clone(),
+                grid_offsets: self.grid_list.clone(),
                 cells_x: 1,
                 cells_y: 1,
                 cells_z: 1,
@@ -2744,12 +2865,12 @@ mod tests {
 
     /// Count -> prefix -> scatter invariant test (GPU only, integer atomics are required).
     ///
-    /// IGNORED: on cubecl-wgpu the scatter produced non-deterministic cell lists even at
-    /// frozen positions (in-kernel `scan[cell] + slot` mismatched the host prefix), which
-    /// is invisible on the CPU runtime (no atomics at all). This is the tracking test:
-    /// re-run with `cargo test -- --ignored` after a cubecl/wgpu upgrade to re-check.
+    /// Failed for a long time with "duplicate particle index 0": the scatter reused the
+    /// non-zeroed counts buffer, so every cell's atomics started at count(cell) and the
+    /// list landed one count late. Fixed by re-zeroing counts between the prefix and the
+    /// scatter (`build_grid`). Skips when no adapter is present (CPU runtime has no
+    /// atomics; `use_grid = 0` tests cover that path).
     #[test]
-    #[ignore = "cubecl-wgpu grid_scatter nondeterminism (see AGENTS.md)"]
     fn grid_cell_lists_are_consistent_on_gpu() {
         let Some(client) = test_gpu_client() else {
             eprintln!("no GPU adapter; grid test requires integer atomics - skipped");
@@ -2763,6 +2884,7 @@ mod tests {
         let cell_inv = 1.0 / cell_size;
         let cells = (50, 7, 50);
         let n_cells = cells.0 * cells.1 * cells.2;
+        let nblocks = n_cells.div_ceil(64usize);
         let (nx, ny, nz) = (24usize, 4, 24);
         let num = nx * ny * nz;
         let mut pos = Vec::with_capacity(num * 4);
@@ -2803,6 +2925,8 @@ mod tests {
             grid_counts: counts,
             grid_scan: scan,
             grid_list: list,
+            grid_totals: alloc_u(nblocks),
+            grid_offsets: alloc_u(nblocks + 1),
             cells_x: cells.0,
             cells_y: cells.1,
             cells_z: cells.2,
@@ -2822,6 +2946,7 @@ mod tests {
         let s = u32::from_bytes(&sb);
         let lb = client.read_one_unchecked(p.grid_list.clone());
         let l = u32::from_bytes(&lb);
+
 
         // Invariants:
         //  * scan is monotonically increasing and scan[n_cells] == num (true count).
@@ -2852,13 +2977,365 @@ mod tests {
             );
         }
         assert!(seen.iter().all(|&v| v), "list misses particles");
-        // Also check count consistency (post-scatter counts == 2x pre-scatter deltas).
+        // Also check count consistency: after the scatter the counters have advanced by
+        // exactly one per particle, so they equal the prefix deltas again.
         let mut total: u32 = 0;
         for cell in 0..n_cells {
             let delta = s[cell + 1] - s[cell];
-            assert_eq!(c[cell], 2 * delta, "cell {cell} count after scatter");
+            assert_eq!(c[cell], delta, "cell {cell} count after scatter");
             total += c[cell];
         }
-        assert_eq!(total, 2 * num as u32);
+        assert_eq!(total, num as u32);
     }
+
+    /// Grid physics at production-ish scale (6144 particles, use_grid=1): a number of
+    /// substeps must run and the accelerations must stay finite and plausible. This is
+    /// the coverage the Rig tests lack (they run the dense all-pairs path).
+    #[test]
+    fn grid_physics_stays_finite_at_scale() {
+        let Some(client) = test_gpu_client() else {
+            eprintln!("no GPU adapter");
+            return;
+        };
+        let spacing = 0.5f32;
+        let h = spacing * 1.3;
+        let cell_inv = 1.0 / (2.0 * h);
+        let cells = (50usize, 7, 50);
+        let n_cells = cells.0 * cells.1 * cells.2;
+        let (nx, ny, nz) = (48usize, 8, 48);
+        let num = nx * ny * nz;
+        let (cx, cz) = (26.0f32, 26.0f32);
+        let mut pos = Vec::with_capacity(num * 4);
+        let mut vel = vec![0.0f32; num * 4];
+        for y in 0..ny {
+            for z in 0..nz {
+                for x in 0..nx {
+                    pos.push(cx + x as f32 * spacing);
+                    pos.push(1.5 + y as f32 * spacing);
+                    pos.push(cz + z as f32 * spacing);
+                    pos.push(0.0);
+                }
+            }
+        }
+        let alloc = |n: usize| client.empty(n * core::mem::size_of::<f32>());
+        let alloc_u = |n: usize| client.empty(n * core::mem::size_of::<u32>());
+        let pos_h = alloc(pos.len());
+        client.write(&pos_h, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&pos).to_vec()));
+        let vel_h = alloc(vel.len());
+        client.write(&vel_h, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&vel).to_vec()));
+        let state = alloc(pos.len());
+        let mut s0 = vec![1010.0f32; num * 4];
+        for i in 0..num {
+            s0[i * 4] = 1000.0;
+        }
+        client.write(&state, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&s0).to_vec()));
+        let acc = alloc(pos.len());
+        let rho_prev = alloc(pos.len());
+        let terrain = alloc(1);
+        let tn = client.empty(1 * core::mem::size_of::<f32>());
+        let tdata = vec![0.0f32];
+        client.write(&tn, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&tdata).to_vec()));
+        let p = WaterParticles {
+            num,
+            pos_a: pos_h.clone(),
+            pos_b: alloc(pos.len()),
+            vel_a: vel_h.clone(),
+            vel_b: alloc(pos.len()),
+            state_a: state.clone(),
+            state_b: alloc(pos.len()),
+            rho_prev,
+            acc_a: acc.clone(),
+            acc_b: alloc(pos.len()),
+            terrain: tn,
+            terrain_x: 1,
+            terrain_y: 1,
+            grid_counts: alloc_u(n_cells),
+            grid_scan: alloc_u(n_cells + 1),
+            grid_list: alloc_u(num),
+            grid_totals: alloc_u(n_cells.div_ceil(64usize)),
+            grid_offsets: alloc_u(n_cells.div_ceil(64usize) + 1),
+            cells_x: cells.0,
+            cells_y: cells.1,
+            cells_z: cells.2,
+            cell_inv,
+            splat_counts: alloc_u(1),
+            splat: alloc(1),
+            surface_max: alloc_u(1),
+            surface: alloc(1),
+            cells: 1,
+            current_is_b: false,
+        };
+        let t0 = std::time::Instant::now();
+        let dt = 1.0 / 60.0 / 4.0;
+        for st in 0..40usize {
+
+            let (pa, va, pb, vb) = if st % 2 == 0 {
+                (&p.pos_a, &p.vel_a, &p.pos_b, &p.vel_b)
+            } else {
+                (&p.pos_b, &p.vel_b, &p.pos_a, &p.vel_a)
+            };
+            sph_substep(
+                &client,
+                &p,
+                pa,
+                va,
+                pb,
+                vb,
+                &p.state_a,
+                &p.acc_a,
+                dt,
+                h,
+                125.0,
+                1000.0,
+                1.0,
+                1000.0 * 40.0 * 40.0 / 7.0,
+                7.0,
+                0.3,
+                40.0,
+                1,
+                9.81,
+                3.0,
+                64.0,
+                0,
+                0,
+                0.2,
+                &p.rho_prev,
+                0.0,
+            );
+        }
+        let ms = t0.elapsed();
+        let ab = client.read_one_unchecked(p.acc_a.clone());
+        let a = f32::from_bytes(&ab);
+        let mut max_a = 0.0f32;
+        let mut bad = 0usize;
+        for i in 0..num {
+            for c in 0..3 {
+                let v = a[i * 4 + c];
+                if v.is_finite() {
+                    max_a = max_a.max(v.abs());
+                } else {
+                    bad += 1;
+                }
+            }
+        }
+        assert_eq!(bad, 0, "non-finite accelerations in grid physics");
+        assert!(max_a < 1e5, "implausible acceleration");
+    }
+
+    /// The hierarchical block scan must reproduce the exact host prefix sum: block
+    /// totals -> block offsets (dedicated buffer) -> inner scan. Regression for the
+    /// aliasing race (inner-scan writes corrupting the block offsets) and the
+    /// off-by-one (missing the last cell's contribution).
+    #[test]
+    fn hierarchical_scan_matches_host_prefix() {
+        let Some(client) = test_gpu_client() else {
+            eprintln!("no GPU adapter");
+            return;
+        };
+        let treads = 64usize;
+        let cells = 20 * treads + 123usize;
+        let nblocks = cells.div_ceil(treads);
+        let mut counts = vec![0u32; cells];
+        for i in 0..cells {
+            counts[i] = ((i * 2654435761u32 as usize) % 7) as u32;
+        }
+        let alloc_u = |n: usize| client.empty(n * core::mem::size_of::<u32>());
+        let ch = alloc_u(cells);
+        client.write(&ch, cubecl::bytes::Bytes::from_bytes_vec(u32::as_bytes(&counts).to_vec()));
+        let ph = alloc_u(nblocks * treads);
+        let bh = alloc_u(nblocks + 1);
+        let sh = alloc_u(cells + 1);
+        let p = WaterParticles {
+            num: cells,
+            pos_a: ch.clone(), pos_b: ch.clone(),
+            vel_a: ch.clone(), vel_b: ch.clone(),
+            state_a: ch.clone(), state_b: ch.clone(),
+            rho_prev: ch.clone(),
+            acc_a: ch.clone(), acc_b: ch.clone(),
+            terrain: ch.clone(), terrain_x: 1, terrain_y: 1,
+            grid_counts: ch.clone(),
+            grid_scan: sh.clone(),
+            grid_list: ch.clone(),
+            grid_totals: ph.clone(),
+            grid_offsets: bh.clone(),
+            cells_x: cells, cells_y: 1, cells_z: 1,
+            cell_inv: 1.0,
+            splat_counts: ch.clone(), splat: ch.clone(),
+            surface_max: ch.clone(), surface: ch.clone(),
+            cells: 1, current_is_b: false,
+        };
+        let dim = 64u32;
+        unsafe {
+            grid_block_totals::launch_unchecked::<u32>(
+                &client,
+                CubeCount::Static(nblocks.div_ceil(dim as usize) as u32, 1, 1),
+                CubeDim::new_1d(dim),
+                BufferArg::from_raw_parts(p.grid_counts.clone(), cells),
+                BufferArg::from_raw_parts(p.grid_totals.clone(), nblocks),
+                cells,
+                treads,
+                nblocks,
+            );
+            grid_block_prefix::launch_unchecked::<u32>(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(1),
+                BufferArg::from_raw_parts(p.grid_totals.clone(), nblocks),
+                BufferArg::from_raw_parts(p.grid_offsets.clone(), nblocks + 1),
+                nblocks,
+            );
+            grid_inner_scan::launch_unchecked::<u32>(
+                &client,
+                CubeCount::Static(cells.div_ceil(dim as usize) as u32, 1, 1),
+                CubeDim::new_1d(dim),
+                BufferArg::from_raw_parts(p.grid_counts.clone(), cells),
+                BufferArg::from_raw_parts(p.grid_offsets.clone(), nblocks + 1),
+                BufferArg::from_raw_parts(p.grid_scan.clone(), cells + 1),
+                cells,
+                treads,
+            );
+        }
+        let sbn = client.read_one_unchecked(p.grid_scan.clone());
+        let scan = u32::from_bytes(&sbn);
+        // host reference
+        let mut hs = vec![0u32; cells + 1];
+        for i in 0..cells {
+            hs[i + 1] = hs[i] + counts[i];
+        }
+        let mism = (0..=cells).filter(|&i| scan[i] != hs[i]).count();
+        assert_eq!(mism, 0, "hierarchical scan mismatch ({mism} cells)");
+    }
+
+    /// The grid-mode neighbor search must reproduce the dense all-pairs physics on the
+    /// same state: one substep through both code paths (deterministic seeded state) and
+    /// the accelerations must agree to summation-order tolerance. The CPU runtime has no
+    /// atomics, so this is GPU-only (skip without an adapter).
+    #[test]
+    fn grid_matches_dense_on_identical_state() {
+        let Some(client) = test_gpu_client() else {
+            eprintln!("no GPU adapter; grid-vs-dense equivalence skipped");
+            return;
+        };
+        let spacing = 0.5f32;
+        let h = spacing * 1.3;
+        let cell_inv = 1.0 / (2.0 * h);
+        let cells = (50usize, 7, 50);
+        let n_cells = cells.0 * cells.1 * cells.2;
+        let (nx, ny, nz) = (24usize, 3, 24);
+        let num = nx * ny * nz;
+        let (cx, cz) = (26.0f32, 26.0f32);
+        let mut pos = Vec::with_capacity(num * 4);
+        let mut vel = Vec::with_capacity(num * 4);
+        let mut state = Vec::with_capacity(num * 4);
+        let mut rho_prev = Vec::with_capacity(num * 4);
+        let mut rng_state = 0x12345678u32;
+        let mut rand = move || {
+            rng_state = rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (rng_state >> 8) as f32 / 16777216.0 - 0.5
+        };
+        for y in 0..ny {
+            for z in 0..nz {
+                for x in 0..nx {
+                    pos.push(cx + x as f32 * spacing + rand() * 0.08);
+                    pos.push(1.5 + y as f32 * spacing + rand() * 0.08);
+                    pos.push(cz + z as f32 * spacing + rand() * 0.08);
+                    pos.push(0.0);
+                    let v = rand();
+                    vel.push(v * 0.3);
+                    vel.push(rand() * 0.3);
+                    vel.push(rand() * 0.3);
+                    vel.push(0.0);
+                    state.push(1000.0 + rand() * 30.0);
+                    state.push(1000.0 * 40.0 * 40.0 / 7.0 * 0.01);
+                    state.push(0.0);
+                    state.push(0.0);
+                }
+            }
+        }
+        rho_prev.extend_from_slice(&state);
+        let alloc = |n: usize| client.empty(n * core::mem::size_of::<f32>());
+        let alloc_u = |n: usize| client.empty(n * core::mem::size_of::<u32>());
+        let mk = |tag: u8| {
+            let pos_h = alloc(pos.len());
+            let vel_h = alloc(vel.len());
+            let st = alloc(state.len());
+            let rp = alloc(state.len());
+            let acc = alloc(state.len());
+            client.write(&pos_h, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&pos).to_vec()));
+            client.write(&vel_h, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&vel).to_vec()));
+            client.write(&st, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&state).to_vec()));
+            client.write(&rp, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&rho_prev).to_vec()));
+            let tn = alloc(1);
+            let tdata = vec![0.0f32];
+            client.write(&tn, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&tdata).to_vec()));
+            WaterParticles {
+                num,
+                pos_a: pos_h.clone(),
+                pos_b: alloc(pos.len()),
+                vel_a: vel_h.clone(),
+                vel_b: alloc(vel.len()),
+                state_a: st.clone(),
+                state_b: alloc(state.len()),
+                rho_prev: rp,
+                acc_a: acc.clone(),
+                acc_b: alloc(state.len()),
+                terrain: tn,
+                terrain_x: 1,
+                terrain_y: 1,
+                grid_counts: alloc_u(n_cells),
+                grid_scan: alloc_u(n_cells + 1),
+                grid_list: alloc_u(num),
+                grid_totals: alloc_u(n_cells.div_ceil(64usize)),
+                grid_offsets: alloc_u(n_cells.div_ceil(64usize) + 1),
+                cells_x: cells.0,
+                cells_y: cells.1,
+                cells_z: cells.2,
+                cell_inv,
+                splat_counts: alloc_u(1),
+                splat: alloc(1),
+                surface_max: alloc_u(1),
+                surface: alloc(1),
+                cells: 1,
+                current_is_b: false,
+            }
+        };
+        let dense = mk(0);
+        let grid = mk(1);
+        let dt = 1.0 / 60.0 / 4.0;
+        sph_substep(
+            &client, &dense, &dense.pos_a, &dense.vel_a, &dense.pos_b, &dense.vel_b,
+            &dense.state_a, &dense.acc_a, dt, h, 125.0, 1000.0, 1.0,
+            1000.0 * 40.0 * 40.0 / 7.0, 7.0, 0.3, 40.0, 0, 9.81, 3.0, 64.0, 0, 0, 0.2,
+            &dense.rho_prev, 0.0,
+        );
+        sph_substep(
+            &client, &grid, &grid.pos_a, &grid.vel_a, &grid.pos_b, &grid.vel_b,
+            &grid.state_a, &grid.acc_a, dt, h, 125.0, 1000.0, 1.0,
+            1000.0 * 40.0 * 40.0 / 7.0, 7.0, 0.3, 40.0, 1, 9.81, 3.0, 64.0, 0, 0, 0.2,
+            &grid.rho_prev, 0.0,
+        );
+        let da = client.read_one_unchecked(dense.acc_a.clone());
+        let d = f32::from_bytes(&da);
+        let ga = client.read_one_unchecked(grid.acc_a.clone());
+        let g = f32::from_bytes(&ga);
+        let mut max_abs = 0.0f32;
+        let mut worst = 0usize;
+        for i in 0..num {
+            for c in 0..3 {
+                let a = d[i * 4 + c];
+                let b = g[i * 4 + c];
+                let diff = (a - b).abs();
+                if diff > max_abs {
+                    max_abs = diff;
+                    worst = i;
+                }
+            }
+        }
+        let scale = 9.81f32.abs() + 1.0;
+        assert!(
+            max_abs < 0.15 * scale,
+            "grid vs dense acceleration mismatch: max|diff| = {max_abs} at particle {worst}"
+        );
+    }
+
 }

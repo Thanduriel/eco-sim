@@ -121,7 +121,7 @@ impl Default for WaterParameters {
             is_active: true,
             substeps: 4,
             particle_spacing: 0.5,
-            blob_size: [12.0, 2.0, 12.0],
+            blob_size: [16.0, 2.0, 16.0],
             debug_count_scale: 4.0,
             terrain_friction: 3.0,
             fluid_density: 1000.0,
