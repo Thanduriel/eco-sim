@@ -113,6 +113,12 @@ pub struct WaterParameters {
     /// Phase 3 rendering: water depth (m) at which the surface alpha saturates (shoreline
     /// transparency).
     pub surface_alpha_scale: f32,
+    /// Phase 4: render the SPH particles themselves (billboard sprites; debugging + spray).
+    pub particle_vis: bool,
+    /// World diameter of the particle sprites (m; spacing is 0.5, so 0.6 slightly overlaps).
+    pub particle_size: f32,
+    /// Alpha of the particle sprites (1.0 = solid; lower = glassy spray).
+    pub particle_alpha: f32,
 }
 
 impl Default for WaterParameters {
@@ -135,6 +141,9 @@ impl Default for WaterParameters {
             max_particle_height: 8.0,
             surface_depth_scale: 4.0,
             surface_alpha_scale: 1.0,
+            particle_vis: true,
+            particle_size: 0.6,
+            particle_alpha: 0.9,
         }
     }
 }

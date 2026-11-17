@@ -1846,6 +1846,16 @@ pub fn run_water(
         field_vis_gpu.image = terrain_assets.field_vis_image.clone();
     }
 
+    // Phase 4: publish the current particle positions (the sprite layer reads them via
+    // `gpu::copy_particles_to_shader_buffer`; the ping-pong buffers hold the same data).
+    let pos_managed = client
+        .get_resource::<cubecl::wgpu::WgpuServer<cubecl::wgpu::AutoCompiler>>(cur_pos.clone())
+        .expect("cubecl buffer should still be alive");
+    let pos_resource = pos_managed.resource();
+    field_vis_gpu.particles.buffer = Some(pos_resource.buffer.clone());
+    field_vis_gpu.particles.offset = pos_resource.offset;
+    field_vis_gpu.particles.count = p.num as u32;
+
     // Phase 3 surface: clear the per-cell max, scatter particle heights (integer atomic
     // max; the `cubecl::Atomic` only supports integer ops), decode to texels with the
     // depth vs the terrain, and publish for the renderer (copied every frame by

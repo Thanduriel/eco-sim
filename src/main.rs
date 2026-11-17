@@ -29,6 +29,7 @@ mod parameters;
 mod player_inputs;
 mod terrain;
 mod water;
+mod particles;
 mod water_surface;
 
 fn main() {
@@ -62,6 +63,7 @@ fn main() {
         .add_plugins(MaterialPlugin::<grass::GrassMaterial>::default())
         .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
         .add_plugins(MaterialPlugin::<water_surface::WaterSurfaceMaterial>::default())
+        .add_plugins(MaterialPlugin::<particles::ParticleMaterial>::default())
         .insert_resource(Time::<Fixed>::from_hz(
             parameters::PHYSICS_TICKS_PER_SEC as f64,
         ))
@@ -78,6 +80,7 @@ fn main() {
                 terrain::setup_terrain,
                 water::setup_water,
                 water_surface::setup_water_surface,
+                particles::setup_particles,
             )
                 .chain(),
         )
@@ -91,6 +94,7 @@ fn main() {
         .add_systems(Update, player_inputs::vis_fields_system)
         .add_systems(Update, terrain::field_vis_refresh_system)
         .add_systems(Update, water_surface::update_water_surface_uniform)
+        .add_systems(Update, particles::update_particle_uniform)
         .add_systems(Update, hud::hud_system)
         .add_systems(Update, player_inputs::general_actions_system)
         .add_systems(FixedUpdate, organism::update_organisms_system)

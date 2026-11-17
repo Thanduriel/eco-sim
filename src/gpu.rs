@@ -16,6 +16,7 @@ use bevy::render::render_resource::{
     TexelCopyTextureInfo, TextureAspect, TextureFormat,
 };
 use bevy::render::renderer::{RenderAdapter, RenderDevice, RenderQueue};
+use bevy::render::storage::GpuShaderBuffer;
 use bevy::render::texture::GpuImage;
 use bevy::render::{Render, RenderApp, RenderSystems};
 use cubecl::prelude::*;
@@ -120,6 +121,21 @@ pub struct FieldVisGpuData {
     pub surface: VisBuffer,
     /// Target texture for the water surface (Rgba32Float, e.g. 256x256).
     pub surface_image: Handle<bevy::image::Image>,
+    /// Phase 4: SPH particle render source — the *current* position buffer (4 f32 per
+    /// particle), copied GPU-side every frame into the `ShaderBuffer` asset bound by
+    /// `particles::ParticleMaterial` (no CPU round-trips).
+    pub particles: ParticleVisSource,
+}
+
+#[derive(Clone, Default)]
+pub struct ParticleVisSource {
+    /// `Some` once the water sim published its position buffer (first tick).
+    pub buffer: Option<wgpu::Buffer>,
+    /// Byte offset into the buffer (cubecl may give back a slice of a larger block).
+    pub offset: u64,
+    pub count: u32,
+    /// Main-world handle of the `ShaderBuffer` asset holding the mirrored positions.
+    pub storage: Handle<bevy::render::storage::ShaderBuffer>,
 }
 
 impl Default for FieldVisGpuData {
@@ -132,6 +148,7 @@ impl Default for FieldVisGpuData {
             active: false,
             surface: VisBuffer::default(),
             surface_image: Handle::default(),
+            particles: ParticleVisSource::default(),
         }
     }
 }
@@ -236,6 +253,41 @@ fn copy_field_vis_to_texture(
     render_queue.submit(Some(command_buffer));
 }
 
+/// Phase 4: mirror the sim's current particle position buffer (cubecl, `[x,y,z,0]` per
+/// particle) into the `ShaderBuffer` asset that `particles::ParticleMaterial` binds, so
+/// the point-sprite shader can read live positions. GPU-only, every frame, before the
+/// material bind groups are used.
+fn copy_particles_to_shader_buffer(
+    data: Option<Res<FieldVisGpuData>>,
+    storage: Res<RenderAssets<GpuShaderBuffer>>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+) {
+    let Some(data) = data else { return };
+    let Some(src_buffer) = &data.particles.buffer else {
+        return;
+    };
+    let count = data.particles.count as usize;
+    if count == 0 {
+        return;
+    }
+    let Some(gpu_storage) = storage.get(&data.particles.storage) else {
+        return;
+    };
+    let size = (count * core::mem::size_of::<[f32; 4]>()) as u64;
+    // The asset's buffer is sized on creation; a mismatch means the sim respawned a
+    // different particle count (not supported mid-run): skip this frame rather than
+    // reading/writing out of bounds.
+    if size > gpu_storage.buffer.size() {
+        return;
+    }
+    let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("particles_to_shader_buffer"),
+    });
+    encoder.copy_buffer_to_buffer(src_buffer, data.particles.offset, &gpu_storage.buffer, 0, size);
+    render_queue.submit(Some(encoder.finish()));
+}
+
 /// Extracts [`FieldVisGpuData`] into the render world and copies it into the
 /// visualization texture each frame (after `GpuImage` assets are prepared).
 pub struct GpuRenderCopyPlugin;
@@ -249,6 +301,12 @@ impl Plugin for GpuRenderCopyPlugin {
             copy_field_vis_to_texture
                 .in_set(RenderSystems::Prepare)
                 .after(prepare_assets::<GpuImage>),
+        );
+        render_app.add_systems(
+            Render,
+            copy_particles_to_shader_buffer
+                .in_set(RenderSystems::Prepare)
+                .after(prepare_assets::<GpuShaderBuffer>),
         );
     }
 }
