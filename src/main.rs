@@ -29,14 +29,12 @@ mod parameters;
 mod player_inputs;
 mod terrain;
 mod water;
-mod particles;
-mod water_surface;
 
 fn main() {
     App::new()
         .insert_resource(GlobalAmbientLight::NONE)
         .add_plugins(DefaultPlugins)
-        .add_plugins(gpu::GpuRenderCopyPlugin)
+        .add_plugins(water::WaterPlugin)
         .add_plugins(EguiPlugin::default())
         .add_plugins(CameraControllerPlugin)
         .add_plugins(EntropyPlugin::<WyRand>::default())
@@ -62,8 +60,7 @@ fn main() {
         .insert_resource(grass::GrassAssets::default())
         .add_plugins(MaterialPlugin::<grass::GrassMaterial>::default())
         .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
-        .add_plugins(MaterialPlugin::<water_surface::WaterSurfaceMaterial>::default())
-        .add_plugins(MaterialPlugin::<particles::ParticleMaterial>::default())
+
         .insert_resource(Time::<Fixed>::from_hz(
             parameters::PHYSICS_TICKS_PER_SEC as f64,
         ))
@@ -73,17 +70,7 @@ fn main() {
         .insert_resource(terrain::TerrainAssets::default())
         .add_systems(EguiPrimaryContextPass, parameters::parameter_ui_system)
         .add_systems(Startup, setup)
-        .add_systems(
-            Startup,
-            (
-                gpu::setup_gpu_context,
-                terrain::setup_terrain,
-                water::setup_water,
-                water_surface::setup_water_surface,
-                particles::setup_particles,
-            )
-                .chain(),
-        )
+        .add_systems(Startup, (gpu::setup_gpu_context, terrain::setup_terrain).chain())
         .add_systems(Update, day_night_cycle)
         .add_systems(
             Update,
@@ -93,14 +80,12 @@ fn main() {
         )
         .add_systems(Update, player_inputs::vis_fields_system)
         .add_systems(Update, terrain::field_vis_refresh_system)
-        .add_systems(Update, water_surface::update_water_surface_uniform)
-        .add_systems(Update, particles::update_particle_uniform)
         .add_systems(Update, hud::hud_system)
         .add_systems(Update, player_inputs::general_actions_system)
         .add_systems(FixedUpdate, organism::update_organisms_system)
         .add_systems(FixedUpdate, organism::propagate_organisms_system)
         .add_systems(FixedUpdate, diffusion::run_cubecl)
-        .add_systems(FixedUpdate, water::run_water)
+
         .run();
 }
 

@@ -123,7 +123,7 @@ pub struct FieldVisGpuData {
     pub surface_image: Handle<bevy::image::Image>,
     /// Phase 4: SPH particle render source — the *current* position buffer (4 f32 per
     /// particle), copied GPU-side every frame into the `ShaderBuffer` asset bound by
-    /// `particles::ParticleMaterial` (no CPU round-trips).
+    /// `water::render::ParticleMaterial` (no CPU round-trips).
     pub particles: ParticleVisSource,
 }
 
@@ -254,8 +254,8 @@ fn copy_field_vis_to_texture(
 }
 
 /// Phase 4: mirror the sim's current particle position buffer (cubecl, `[x,y,z,0]` per
-/// particle) into the `ShaderBuffer` asset that `particles::ParticleMaterial` binds, so
-/// the point-sprite shader can read live positions. GPU-only, every frame, before the
+/// particle) into the `ShaderBuffer` asset that `water::render::ParticleMaterial` binds,
+/// so the point-sprite shader can read live positions. GPU-only, every frame, before the
 /// material bind groups are used.
 fn copy_particles_to_shader_buffer(
     data: Option<Res<FieldVisGpuData>>,
