@@ -201,6 +201,12 @@
                 rho_prev: self.rho_prev.clone(),
                 acc_a: self.acc.clone(),
                 acc_b: self.acc.clone(),
+                // Separate buffer from `acc`: `xsph_pass` reads acc and writes the delta
+                // in the same kernel — aliasing them would read the freshly scattered
+                // delta as some neighbors' accelerations.
+                xsph_delta: self
+                    .client
+                    .empty(self.num * 4 * core::mem::size_of::<f32>()),
                 terrain: self.terrain.clone(),
                 terrain_x: self.terrain_x,
                 terrain_y: self.terrain_y,
@@ -291,7 +297,8 @@
                     BufferArg::from_raw_parts(pi.clone(), 4),
                     BufferArg::from_raw_parts(vi.clone(), 4),
                     BufferArg::from_raw_parts(rig.acc.clone(), 4),
-                    BufferArg::from_raw_parts(rig.state.clone(), 4),
+                    // delta placeholder: xsph = 0 below, so the guard skips it entirely.
+                    BufferArg::from_raw_parts(rig.acc.clone(), 4),
                     BufferArg::from_raw_parts(po.clone(), 4),
                     BufferArg::from_raw_parts(vo.clone(), 4),
                     BufferArg::from_raw_parts(rig.terrain.clone(), 64),
@@ -299,11 +306,8 @@
                     GRAVITY,
                     64.0,
                     TERRAIN_FRICTION,
-                    RHO0 * 0.5 * 0.5 * 0.5,
                     0.0,
                     0.65,
-                    0.4225,
-                    1.0 / (core::f32::consts::PI * 0.65 * 0.65 * 0.65),
                     rig.terrain_x,
                     rig.terrain_y,
                     1,
@@ -1032,6 +1036,7 @@
             rho_prev: pos_h.clone(),
             acc_a: pos_h.clone(),
             acc_b: pos_h.clone(),
+            xsph_delta: pos_h.clone(),
             terrain: pos_h.clone(),
             terrain_x: 1,
             terrain_y: 1,
@@ -1158,6 +1163,7 @@
             rho_prev,
             acc_a: acc.clone(),
             acc_b: alloc(pos.len()),
+            xsph_delta: alloc(pos.len()),
             terrain: tn,
             terrain_x: 1,
             terrain_y: 1,
@@ -1273,6 +1279,7 @@
             grid_list: ch.clone(),
             grid_totals: ph.clone(),
             grid_offsets: bh.clone(),
+            xsph_delta: ch.clone(),
             cells_x: cells, cells_y: 1, cells_z: 1,
             cell_inv: 1.0,
             splat_counts: ch.clone(), splat: ch.clone(),
@@ -1394,6 +1401,7 @@
                 rho_prev: rp,
                 acc_a: acc.clone(),
                 acc_b: alloc(state.len()),
+                xsph_delta: alloc(state.len()),
                 terrain: tn,
                 terrain_x: 1,
                 terrain_y: 1,
@@ -1471,4 +1479,485 @@
             max_abs < 0.15 * scale,
             "grid vs dense acceleration mismatch: max|diff| = {max_abs} at particle {worst}"
         );
+    }
+
+    /// Kernel-level timing of the production pipeline (headless wgpu device, no
+    /// rendering) at increasing particle counts. Run with:
+    ///
+    /// ```text
+    /// cargo test profile_pipeline_scaling -- --ignored --nocapture
+    /// ```
+    ///
+    /// Async submission measures enqueueing, not GPU execution, so every stage is
+    /// followed by a forced `client.sync()` (the established measurement method in this
+    /// repo; the app's misleading FPS numbers come from trusting submit time). Each
+    /// kernel is timed in isolation — the GPU idles between syncs, so per-kernel numbers
+    /// are slightly inflated by sync overhead, but the split is real. The per-tick
+    /// number uses a single sync over a full 4-substep tick + vis kernels (the real
+    /// back-to-back cost, comparable to the 60 Hz fixed-step budget of 16.7 ms).
+    #[test]
+    #[ignore]
+    fn profile_pipeline_scaling() {
+        let Some(client) = test_gpu_client() else {
+            eprintln!("no GPU adapter; kernel timings need the wgpu backend");
+            return;
+        };
+        let wp = crate::parameters::WaterParameters::default();
+        let s = wp.particle_spacing;
+        let dim = LAUNCH_DIM;
+        let wgs = |n: usize| n.div_ceil(dim as usize) as u32;
+        const TREADS: usize = 64;
+        const ITERS: usize = 10;
+
+        // Production-shaped grid: cell size = 2h, full 64 m domain.
+        let cell_size = 2.0 * s * wp.smoothing_ratio;
+        let cells_x = (crate::domain::SIZE_F32.x / cell_size).ceil() as usize;
+        let cells_y = (crate::domain::SIZE_F32.y / cell_size).ceil() as usize;
+        let cells_z = (crate::domain::SIZE_F32.y / cell_size).ceil() as usize;
+        let cells = cells_x * cells_y * cells_z;
+        let cell_inv = 1.0 / cell_size;
+        let nblocks = cells.div_ceil(TREADS);
+        let splat_cells = 256usize;
+        let cells_sq = splat_cells * splat_cells;
+        let tx = 512usize;
+        let ty = 512usize;
+        let mut terrain = vec![0.0f32; tx * ty];
+        for y in 0..ty {
+            for x in 0..tx {
+                let fx = x as f32 * 0.125;
+                let fy = y as f32 * 0.125;
+                terrain[y * tx + x] = 2.5
+                    * (0.6 * (fx * 0.31).sin() * (fy * 0.27).cos() + 0.4 * (fx * 0.13 + fy * 0.17).sin());
+            }
+        }
+        let bytes = |d: &[f32]| cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(d).to_vec());
+        let buf_f = |n: usize| client.empty(n * core::mem::size_of::<f32>());
+        let buf_u = |n: usize| client.empty(n * core::mem::size_of::<u32>());
+
+        let sph = SphParams::from_water_parameters(&wp, s, crate::domain::SIZE_F32.x);
+        let SphParams {
+            h, h2, sigma, mass, rho0, rho_min_frac, b, gamma, alpha, speed_of_sound, neighbor,
+            domain, gravity, friction, boundary, correction, xsph, diffusion,
+        } = sph;
+        let dt = 1.0 / crate::parameters::PHYSICS_TICKS_PER_SEC as f32 / wp.substeps.max(1) as f32;
+
+        // (label, particles per axis) — derived from the blob sizes used in production
+        // notes: [12,2,12] -> 2304, [16,2,16] -> 4096 (default), heights 3/6/9/18/36/72.
+        let configs: [(&str, usize, usize, usize); 8] = [
+            ("12x2x12", 24, 4, 24),
+            ("16x2x16", 32, 4, 32),
+            ("16x3x16", 32, 6, 32),
+            ("16x6x16", 32, 12, 32),
+            ("16x9x16", 32, 18, 32),
+            ("16x18x16", 32, 36, 32),
+            ("16x36x16", 32, 72, 32),
+            ("16x72x16", 32, 144, 32),
+        ];
+
+        fn bench(client: &Client, iters: usize, mut f: impl FnMut(&Client)) -> f64 {
+            let mut sum = 0.0f64;
+            for _ in 0..iters {
+                let t0 = std::time::Instant::now();
+                f(client);
+                bevy::tasks::block_on(client.sync()).unwrap();
+                sum += t0.elapsed().as_secs_f64() * 1e3;
+            }
+            sum / iters as f64
+        }
+
+        let mut summary = String::new();
+        for (label, nx, ny, nz) in configs {
+            let num = nx * ny * nz;
+            let mut posv = Vec::with_capacity(num * 4);
+            for y in 0..ny {
+                for z in 0..nz {
+                    for x in 0..nx {
+                        posv.push(32.0 - (nx as f32 * s) * 0.5 + x as f32 * s);
+                        posv.push(3.0 + y as f32 * s);
+                        posv.push(32.0 - (nz as f32 * s) * 0.5 + z as f32 * s);
+                        posv.push(0.0);
+                    }
+                }
+            }
+            let pos_h = buf_f(num * 4);
+            let vel_h = buf_f(num * 4);
+            let state_h = buf_f(num * 4);
+            let rho_prev_h = buf_f(num * 4);
+            let acc_h = buf_f(num * 4);
+            let delta_h = buf_f(num * 4);
+            let terr_h = buf_f(tx * ty);
+            let counts_h = buf_u(cells);
+            let scan_h = buf_u(cells + 1);
+            let list_h = buf_u(num);
+            let totals_h = buf_u(nblocks);
+            let offsets_h = buf_u(nblocks + 1);
+            let splat_counts_h = buf_u(cells_sq);
+            let splat_h = buf_f(cells_sq * 4);
+            let surf_max_h = buf_u(cells_sq);
+            let surf_h = buf_f(cells_sq * 4);
+            client.write(&pos_h, bytes(&posv));
+            client.write(&vel_h, bytes(&vec![0.0; num * 4]));
+            client.write(&rho_prev_h, bytes(&vec![wp.fluid_density; num * 4]));
+            client.write(&terr_h, bytes(&terrain));
+
+            let p = WaterParticles {
+                num,
+                pos_a: pos_h.clone(),
+                pos_b: buf_f(num * 4),
+                vel_a: vel_h.clone(),
+                vel_b: buf_f(num * 4),
+                state_a: state_h.clone(),
+                state_b: state_h.clone(),
+                rho_prev: rho_prev_h.clone(),
+                acc_a: acc_h.clone(),
+                acc_b: acc_h.clone(),
+                xsph_delta: delta_h.clone(),
+                terrain: terr_h.clone(),
+                terrain_x: tx,
+                terrain_y: ty,
+                grid_counts: counts_h.clone(),
+                grid_scan: scan_h.clone(),
+                grid_list: list_h.clone(),
+                grid_totals: totals_h.clone(),
+                grid_offsets: offsets_h.clone(),
+                cells_x,
+                cells_y,
+                cells_z,
+                cell_inv,
+                splat_counts: splat_counts_h.clone(),
+                splat: splat_h.clone(),
+                surface_max: surf_max_h.clone(),
+                surface: surf_h.clone(),
+                cells: splat_cells,
+                current_is_b: false,
+            };
+
+            // Warm-up (first launch of each kernel compiles it).
+            unsafe {
+                grid_zero::launch_unchecked::<u32>(
+                    &client, CubeCount::Static(wgs(cells), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(counts_h.clone(), cells), cells,
+                );
+                grid_count::launch_unchecked::<f32, u32>(
+                    &client, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(counts_h.clone(), cells),
+                    cell_inv, cells_x, cells_y, cells_z, num,
+                );
+                grid_block_totals::launch_unchecked::<u32>(
+                    &client, CubeCount::Static(wgs(nblocks), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(counts_h.clone(), cells),
+                    BufferArg::from_raw_parts(totals_h.clone(), nblocks),
+                    cells, TREADS, nblocks,
+                );
+                grid_block_prefix::launch_unchecked::<u32>(
+                    &client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(1),
+                    BufferArg::from_raw_parts(totals_h.clone(), nblocks),
+                    BufferArg::from_raw_parts(offsets_h.clone(), nblocks + 1), nblocks,
+                );
+                grid_inner_scan::launch_unchecked::<u32>(
+                    &client, CubeCount::Static(wgs(cells), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(counts_h.clone(), cells),
+                    BufferArg::from_raw_parts(offsets_h.clone(), nblocks + 1),
+                    BufferArg::from_raw_parts(scan_h.clone(), cells + 1),
+                    cells, TREADS,
+                );
+                grid_scatter::launch_unchecked::<f32, u32>(
+                    &client, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(scan_h.clone(), cells + 1),
+                    BufferArg::from_raw_parts(counts_h.clone(), cells),
+                    BufferArg::from_raw_parts(list_h.clone(), num),
+                    cell_inv, cells_x, cells_y, cells_z, num,
+                );
+                compute_density::launch_unchecked::<f32, u32>(
+                    &client, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(scan_h.clone(), cells + 1),
+                    BufferArg::from_raw_parts(list_h.clone(), num),
+                    BufferArg::from_raw_parts(state_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(rho_prev_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(terr_h.clone(), tx * ty),
+                    tx, ty, h, h2, sigma, mass, diffusion, rho0, rho_min_frac, b, gamma,
+                    cell_inv, domain, cells_x, cells_y, cells_z, num,
+                    neighbor as u32, boundary as u32, correction as u32,
+                );
+                compute_force::launch_unchecked::<f32, u32>(
+                    &client, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(vel_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(state_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(scan_h.clone(), cells + 1),
+                    BufferArg::from_raw_parts(list_h.clone(), num),
+                    BufferArg::from_raw_parts(acc_h.clone(), num * 4),
+                    h, h2, sigma, mass, alpha, speed_of_sound, cell_inv, domain,
+                    cells_x, cells_y, cells_z, num, neighbor as u32, boundary as u32,
+                );
+                xsph_pass::launch_unchecked::<f32, u32>(
+                    &client, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(vel_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(acc_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(state_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(scan_h.clone(), cells + 1),
+                    BufferArg::from_raw_parts(list_h.clone(), num),
+                    BufferArg::from_raw_parts(delta_h.clone(), num * 4),
+                    dt, gravity, domain, mass, xsph, h, h2, sigma, cell_inv,
+                    cells_x, cells_y, cells_z, num,
+                    neighbor as u32, boundary as u32,
+                );
+                integrate_half::launch_unchecked::<f32>(
+                    &client, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(vel_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(acc_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(delta_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(p.pos_b.clone(), num * 4),
+                    BufferArg::from_raw_parts(p.vel_b.clone(), num * 4),
+                    BufferArg::from_raw_parts(terr_h.clone(), tx * ty),
+                    dt, gravity, domain, friction, xsph, h, tx, ty, num,
+                    boundary as u32,
+                );
+                finish_verlet::launch_unchecked::<f32>(
+                    &client, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(p.vel_b.clone(), num * 4),
+                    BufferArg::from_raw_parts(acc_h.clone(), num * 4),
+                    dt, gravity, num,
+                );
+                splat_clear::launch_unchecked::<u32>(
+                    &client, CubeCount::Static(wgs(cells_sq), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(splat_counts_h.clone(), cells_sq), splat_cells,
+                );
+                particle_to_splat::launch_unchecked::<u32, f32>(
+                    &client, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(splat_counts_h.clone(), cells_sq),
+                    crate::domain::SIZE_F32.x, splat_cells as f32, num,
+                );
+                surface_clear::launch_unchecked::<u32>(
+                    &client, CubeCount::Static(wgs(cells_sq), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(surf_max_h.clone(), cells_sq), cells_sq,
+                );
+                particle_to_surface::launch_unchecked::<f32, u32>(
+                    &client, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(surf_max_h.clone(), cells_sq),
+                    crate::domain::SIZE_F32.x, splat_cells, num,
+                );
+            }
+            bevy::tasks::block_on(client.sync()).unwrap();
+
+            let t_z = bench(&client, ITERS, |c| unsafe {
+                grid_zero::launch_unchecked::<u32>(
+                    c, CubeCount::Static(wgs(cells), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(counts_h.clone(), cells), cells,
+                );
+            });
+            let t_c = bench(&client, ITERS, |c| unsafe {
+                grid_count::launch_unchecked::<f32, u32>(
+                    c, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(counts_h.clone(), cells),
+                    cell_inv, cells_x, cells_y, cells_z, num,
+                );
+            });
+            let t_bt = bench(&client, ITERS, |c| unsafe {
+                grid_block_totals::launch_unchecked::<u32>(
+                    c, CubeCount::Static(wgs(nblocks), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(counts_h.clone(), cells),
+                    BufferArg::from_raw_parts(totals_h.clone(), nblocks),
+                    cells, TREADS, nblocks,
+                );
+            });
+            let t_bp = bench(&client, ITERS, |c| unsafe {
+                grid_block_prefix::launch_unchecked::<u32>(
+                    c, CubeCount::Static(1, 1, 1), CubeDim::new_1d(1),
+                    BufferArg::from_raw_parts(totals_h.clone(), nblocks),
+                    BufferArg::from_raw_parts(offsets_h.clone(), nblocks + 1), nblocks,
+                );
+            });
+            let t_is = bench(&client, ITERS, |c| unsafe {
+                grid_inner_scan::launch_unchecked::<u32>(
+                    c, CubeCount::Static(wgs(cells), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(counts_h.clone(), cells),
+                    BufferArg::from_raw_parts(offsets_h.clone(), nblocks + 1),
+                    BufferArg::from_raw_parts(scan_h.clone(), cells + 1),
+                    cells, TREADS,
+                );
+            });
+            let t_sc = bench(&client, ITERS, |c| unsafe {
+                grid_scatter::launch_unchecked::<f32, u32>(
+                    c, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(scan_h.clone(), cells + 1),
+                    BufferArg::from_raw_parts(counts_h.clone(), cells),
+                    BufferArg::from_raw_parts(list_h.clone(), num),
+                    cell_inv, cells_x, cells_y, cells_z, num,
+                );
+            });
+            let t_d = bench(&client, ITERS, |c| unsafe {
+                compute_density::launch_unchecked::<f32, u32>(
+                    c, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(scan_h.clone(), cells + 1),
+                    BufferArg::from_raw_parts(list_h.clone(), num),
+                    BufferArg::from_raw_parts(state_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(rho_prev_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(terr_h.clone(), tx * ty),
+                    tx, ty, h, h2, sigma, mass, diffusion, rho0, rho_min_frac, b, gamma,
+                    cell_inv, domain, cells_x, cells_y, cells_z, num,
+                    neighbor as u32, boundary as u32, correction as u32,
+                );
+            });
+            let t_f = bench(&client, ITERS, |c| unsafe {
+                compute_force::launch_unchecked::<f32, u32>(
+                    c, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(vel_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(state_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(scan_h.clone(), cells + 1),
+                    BufferArg::from_raw_parts(list_h.clone(), num),
+                    BufferArg::from_raw_parts(acc_h.clone(), num * 4),
+                    h, h2, sigma, mass, alpha, speed_of_sound, cell_inv, domain,
+                    cells_x, cells_y, cells_z, num, neighbor as u32, boundary as u32,
+                );
+            });
+            let t_x = bench(&client, ITERS, |c| unsafe {
+                xsph_pass::launch_unchecked::<f32, u32>(
+                    c, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(vel_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(acc_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(state_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(scan_h.clone(), cells + 1),
+                    BufferArg::from_raw_parts(list_h.clone(), num),
+                    BufferArg::from_raw_parts(delta_h.clone(), num * 4),
+                    dt, gravity, domain, mass, xsph, h, h2, sigma, cell_inv,
+                    cells_x, cells_y, cells_z, num,
+                    neighbor as u32, boundary as u32,
+                );
+            });
+            let t_i = bench(&client, ITERS, |c| unsafe {
+                integrate_half::launch_unchecked::<f32>(
+                    c, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(vel_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(acc_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(delta_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(p.pos_b.clone(), num * 4),
+                    BufferArg::from_raw_parts(p.vel_b.clone(), num * 4),
+                    BufferArg::from_raw_parts(terr_h.clone(), tx * ty),
+                    dt, gravity, domain, friction, xsph, h, tx, ty, num,
+                    boundary as u32,
+                );
+            });
+            let t_fin = bench(&client, ITERS, |c| unsafe {
+                finish_verlet::launch_unchecked::<f32>(
+                    c, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(p.vel_b.clone(), num * 4),
+                    BufferArg::from_raw_parts(acc_h.clone(), num * 4),
+                    dt, gravity, num,
+                );
+            });
+            let t_rp = bench(&client, ITERS, |c| unsafe {
+                copy_rho_prev::launch_unchecked::<f32>(
+                    c, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(state_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(rho_prev_h.clone(), num * 4), num,
+                );
+            });
+            let t_vis = bench(&client, ITERS, |c| unsafe {
+                splat_clear::launch_unchecked::<u32>(
+                    c, CubeCount::Static(wgs(cells_sq), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(splat_counts_h.clone(), cells_sq), splat_cells,
+                );
+                particle_to_splat::launch_unchecked::<u32, f32>(
+                    c, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(splat_counts_h.clone(), cells_sq),
+                    crate::domain::SIZE_F32.x, splat_cells as f32, num,
+                );
+                counts_to_texels::launch_unchecked::<u32, f32>(
+                    c, CubeCount::Static(wgs(cells_sq), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(splat_counts_h.clone(), cells_sq),
+                    BufferArg::from_raw_parts(splat_h.clone(), cells_sq * 4),
+                    wp.debug_count_scale, splat_cells,
+                );
+                surface_clear::launch_unchecked::<u32>(
+                    c, CubeCount::Static(wgs(cells_sq), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(surf_max_h.clone(), cells_sq), cells_sq,
+                );
+                particle_to_surface::launch_unchecked::<f32, u32>(
+                    c, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(pos_h.clone(), num * 4),
+                    BufferArg::from_raw_parts(surf_max_h.clone(), cells_sq),
+                    crate::domain::SIZE_F32.x, splat_cells, num,
+                );
+                surface_to_texels::launch_unchecked::<f32, u32>(
+                    c, CubeCount::Static(wgs(cells_sq), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(surf_max_h.clone(), cells_sq),
+                    BufferArg::from_raw_parts(terr_h.clone(), tx * ty),
+                    BufferArg::from_raw_parts(surf_h.clone(), cells_sq * 4),
+                    crate::domain::SIZE_F32.x, splat_cells, tx, ty,
+                );
+            });
+            // Real back-to-back tick: 4 ping-pong substeps + vis, one sync.
+            let t_tick = bench(&client, 4, |c| {
+                let mut use_b = false;
+                for _ in 0..4 {
+                    let (pin, vin, pout, vout, st, ac) = if use_b {
+                        (&p.pos_b, &p.vel_b, &p.pos_a, &p.vel_a, &p.state_a, &p.acc_a)
+                    } else {
+                        (&p.pos_a, &p.vel_a, &p.pos_b, &p.vel_b, &p.state_b, &p.acc_b)
+                    };
+                    sph_substep(c, &p, pin, vin, pout, vout, st, ac, &p.rho_prev, dt, sph);
+                    use_b = !use_b;
+                }
+                let cur = if use_b { &p.pos_b } else { &p.pos_a };
+                unsafe {
+                    splat_clear::launch_unchecked::<u32>(
+                        c, CubeCount::Static(wgs(cells_sq), 1, 1), CubeDim::new_1d(dim),
+                        BufferArg::from_raw_parts(splat_counts_h.clone(), cells_sq), splat_cells,
+                    );
+                    particle_to_splat::launch_unchecked::<u32, f32>(
+                        c, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                        BufferArg::from_raw_parts(cur.clone(), num * 4),
+                        BufferArg::from_raw_parts(splat_counts_h.clone(), cells_sq),
+                        crate::domain::SIZE_F32.x, splat_cells as f32, num,
+                    );
+                    surface_clear::launch_unchecked::<u32>(
+                        c, CubeCount::Static(wgs(cells_sq), 1, 1), CubeDim::new_1d(dim),
+                        BufferArg::from_raw_parts(surf_max_h.clone(), cells_sq), cells_sq,
+                    );
+                    particle_to_surface::launch_unchecked::<f32, u32>(
+                        c, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                        BufferArg::from_raw_parts(cur.clone(), num * 4),
+                        BufferArg::from_raw_parts(surf_max_h.clone(), cells_sq),
+                        crate::domain::SIZE_F32.x, splat_cells, num,
+                    );
+                }
+            });
+
+            let build = t_z + t_c + t_bt + t_bp + t_is + t_z + t_sc;
+            let substep = build + t_d + t_f + t_x + t_i + t_fin + t_rp;
+            eprintln!(
+                "[{label}] n={num:>7}  cells={cells}  (60 Hz budget 16.67 ms/tick)"
+            );
+            eprintln!(
+                "  grid:    zero {t_z:6.3} | count {t_c:6.3} | totals {t_bt:6.3} | prefix {t_bp:6.3} | scan {t_is:6.3} | scatter {t_sc:6.3}   build={build:7.3}"
+            );
+            eprintln!(
+                "  force:   density {t_d:7.3} | force {t_f:7.3}   | xsph {t_x:6.3} | integrate {t_i:6.3} | finish {t_fin:6.3} | copy {t_rp:6.3}"
+            );
+            eprintln!(
+                "  vis:     splat+surface {t_vis:8.3}    | substep {substep:8.3}   | tick(w/ vis) {t_tick:9.3}"
+            );
+            summary.push_str(&format!(
+                "{label:>11} n={num:>7}: substep {substep:8.3} ms, tick {t_tick:9.3} ms (≈ {:.1} FPS max, {:.0}% of 60 Hz budget)\n",
+                1000.0 / t_tick.max(1e-9), t_tick * 60.0 / 1000.0 * 100.0,
+            ));
+        }
+        eprintln!();
+        eprintln!("=== summary ===");
+        eprint!("{}", summary);
     }

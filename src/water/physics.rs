@@ -163,6 +163,10 @@ pub struct WaterParticles {
     /// applied by the integrator).
     pub acc_a: Handle,
     pub acc_b: Handle,
+    /// XSPH velocity increment `[avx, avy, avz, 0]` written by `xsph_pass` each substep
+    /// and applied by `integrate_half` (`v += xsph * delta`). A separate buffer keeps
+    /// both kernels under the wgpu 8-storage-buffer limit (they would otherwise need 9).
+    pub xsph_delta: Handle,
     /// Terrain height map (grid points at `i * h`, Vertex convention), uploaded once.
     pub terrain: Handle,
     pub terrain_x: usize,
@@ -206,7 +210,7 @@ pub struct WaterParticles {
 
 /// Copies the latest density into the `rho_prev` scratch (deterministic delta-SPH input).
 #[cube(launch_unchecked)]
-fn copy_rho_prev<F: Float + LaunchArg>(state: &[F], rho_prev: &mut [F], num: usize) {
+pub(super) fn copy_rho_prev<F: Float + LaunchArg>(state: &[F], rho_prev: &mut [F], num: usize) {
     let i = ABSOLUTE_POS_X as usize;
     if i >= num {
         terminate!();
@@ -217,7 +221,7 @@ fn copy_rho_prev<F: Float + LaunchArg>(state: &[F], rho_prev: &mut [F], num: usi
 
 /// Zero the per-cell counters.
 #[cube(launch_unchecked)]
-fn grid_zero<I: Int + LaunchArg>(counts: &mut [I], cells: usize) {
+pub(super) fn grid_zero<I: Int + LaunchArg>(counts: &mut [I], cells: usize) {
     let i = ABSOLUTE_POS_X as usize;
     if i < cells {
         counts[i] = I::new(0);
@@ -227,7 +231,7 @@ fn grid_zero<I: Int + LaunchArg>(counts: &mut [I], cells: usize) {
 /// Per-particle cell counter (integer atomics). Cell size equals the SPH support
 /// radius (2h), so a 3x3x3 cell window fully covers the kernel support.
 #[cube(launch_unchecked)]
-fn grid_count<F: Float + LaunchArg, I: Int + LaunchArg>(
+pub(super) fn grid_count<F: Float + LaunchArg, I: Int + LaunchArg>(
     pos: &[F],
     counts: &[Atomic<I>],
     cell_inv: F,
@@ -340,7 +344,7 @@ pub(super) fn grid_inner_scan<I: Int + LaunchArg>(
 
 /// Scatter particle indices into per-cell ranges (cell size 2h; see [`grid_count`]).
 #[cube(launch_unchecked)]
-fn grid_scatter<F: Float + LaunchArg, I: Int + LaunchArg>(
+pub(super) fn grid_scatter<F: Float + LaunchArg, I: Int + LaunchArg>(
     pos: &[F],
     scan: &[I],
     counts: &[Atomic<I>],
@@ -384,7 +388,7 @@ fn grid_scatter<F: Float + LaunchArg, I: Int + LaunchArg>(
 /// to it in `state` (`[rho, p, 0, 0]`). `use_grid=0` scans all particles (used by the
 /// CPU-runtime tests); `use_grid=1` iterates the 3x3x3 cell neighborhood.
 #[cube(launch_unchecked)]
-fn compute_density<F: Float + LaunchArg, I: Int + LaunchArg>(
+pub(super) fn compute_density<F: Float + LaunchArg, I: Int + LaunchArg>(
     pos: &[F],
     scan: &[I],
     list: &[I],
@@ -710,7 +714,7 @@ fn compute_density<F: Float + LaunchArg, I: Int + LaunchArg>(
 
 /// WCSPH accelerations: pressure gradient only (dense; viscosity added next).
 #[cube(launch_unchecked)]
-fn compute_force<F: Float + LaunchArg, I: Int + LaunchArg>(
+pub(super) fn compute_force<F: Float + LaunchArg, I: Int + LaunchArg>(
     pos: &[F],
     vel: &[F],
     state: &[F],
@@ -920,15 +924,201 @@ fn compute_force<F: Float + LaunchArg, I: Int + LaunchArg>(
     acc[p + 3] = F::new(0.0_f32);
 }
 
+/// XSPH velocity-smoothing increment: `delta = Σ_j f_ij (v̄_j − v̄_i)` (the position
+/// update adds `xsph * delta`). Split out of `integrate_half` because the kernel there
+/// has 9 storage-buffer arguments, over the wgpu `max_storage_buffers_per_shader_stage`
+/// limit of 8 (grid + state + ...). The uniform grid at the CURRENT positions was just
+/// built by the preceding force pass, so this reuses it (no extra scan). `use_grid=0`
+/// scans all pairs (the CPU-runtime / periodic-test path, where the grid is not built);
+/// the density/force kernels use the same split. Writes `delta` even when `xsph == 0`
+/// (zeros), so the integrating kernel can always read it.
+#[cube(launch_unchecked)]
+pub(super) fn xsph_pass<F: Float + LaunchArg, I: Int + LaunchArg>(
+    pos: &[F],
+    vel: &[F],
+    acc: &[F],
+    state: &[F],
+    scan: &[I],
+    list: &[I],
+    delta: &mut [F],
+    dt: F,
+    gravity: F,
+    domain_size: F,
+    mass: F,
+    xsph: F,
+    h: F,
+    h2: F,
+    sigma: F,
+    cell_inv: F,
+    cx: usize,
+    cy: usize,
+    cz: usize,
+    num: usize,
+    use_grid: u32,
+    periodic: u32,
+) {
+    let i = ABSOLUTE_POS_X as usize;
+    if i >= num {
+        terminate!();
+    }
+    let p = i * 4;
+    let ht = dt * F::new(0.5_f32);
+    let vx = vel[p] + acc[p] * ht;
+    let vy = vel[p + 1] + (acc[p + 1] - gravity) * ht;
+    let vz = vel[p + 2] + acc[p + 2] * ht;
+    let mut avx = F::new(0.0_f32);
+    let mut avy = F::new(0.0_f32);
+    let mut avz = F::new(0.0_f32);
+    if xsph > F::new(0.0_f32) {
+        let support2 = F::new(4.0_f32) * h2;
+        if use_grid == 0 {
+            // Dense all-pairs (CPU-runtime / periodic tests).
+            for j in 0..num {
+                if j != i {
+                    let pj = j * 4;
+                    let mut dxx = pos[p] - pos[pj];
+                    let dyy = pos[p + 1] - pos[pj + 1];
+                    let mut dzz = pos[p + 2] - pos[pj + 2];
+                    if periodic == 1 {
+                        let half = domain_size * F::new(0.5_f32);
+                        if dxx > half {
+                            dxx = dxx - domain_size;
+                        }
+                        if dxx < -half {
+                            dxx = dxx + domain_size;
+                        }
+                        if dzz > half {
+                            dzz = dzz - domain_size;
+                        }
+                        if dzz < -half {
+                            dzz = dzz + domain_size;
+                        }
+                    }
+                    if periodic == 2 {
+                        let half = domain_size * F::new(0.5_f32);
+                        if dxx > half {
+                            dxx = dxx - domain_size;
+                        }
+                        if dxx < -half {
+                            dxx = dxx + domain_size;
+                        }
+                        if dzz > half {
+                            dzz = dzz - domain_size;
+                        }
+                        if dzz < -half {
+                            dzz = dzz + domain_size;
+                        }
+                    }
+                    let r2 = dxx * dxx + dyy * dyy + dzz * dzz;
+                    if r2 < support2 && r2 > F::new(1e-12_f32) {
+                        let q = (r2).sqrt() / h;
+                        let q2 = q * q;
+                        let mut w = F::new(0.0_f32);
+                        if q < F::new(1.0_f32) {
+                            w = sigma * (F::new(1.0_f32) - F::new(1.5_f32) * q2 + F::new(0.75_f32) * q2 * q);
+                        } else {
+                            if q < F::new(2.0_f32) {
+                                let t = F::new(2.0_f32) - q;
+                                w = sigma * F::new(0.25_f32) * t * t * t;
+                            }
+                        }
+                        let rho_bar = (state[p] + state[pj]) * F::new(0.5_f32);
+                        let f = mass * w / rho_bar;
+                        let vjx = vel[pj] + acc[pj] * ht;
+                        let vjy = vel[pj + 1] + (acc[pj + 1] - gravity) * ht;
+                        let vjz = vel[pj + 2] + acc[pj + 2] * ht;
+                        avx = avx + f * (vjx - vx);
+                        avy = avy + f * (vjy - vy);
+                        avz = avz + f * (vjz - vz);
+                    }
+                }
+            }
+        } else {
+            // 3x3x3 uniform-grid window (production, Closed boundary, no wrap).
+            let gx = clamp(
+                pos[p] * cell_inv,
+                F::new(0.0_f32),
+                F::cast_from((cx - 1) as f32),
+            );
+            let gy = clamp(
+                pos[p + 1] * cell_inv,
+                F::new(0.0_f32),
+                F::cast_from((cy - 1) as f32),
+            );
+            let gz = clamp(
+                pos[p + 2] * cell_inv,
+                F::new(0.0_f32),
+                F::cast_from((cz - 1) as f32),
+            );
+            let icx = usize::cast_from(gx) as i32;
+            let icy = usize::cast_from(gy) as i32;
+            let icz = usize::cast_from(gz) as i32;
+            for cdz in 0..3i32 {
+                for cdy in 0..3i32 {
+                    for cdx in 0..3i32 {
+                        let nc = icx + (cdx - 1);
+                        let nr = icy + (cdy - 1);
+                        let nh = icz + (cdz - 1);
+                        if nc >= 0 && nc < cx as i32 && nr >= 0 && nr < cy as i32
+                            && nh >= 0 && nh < cz as i32
+                        {
+                            let cell = nc as usize + cx * (nr as usize + cy * nh as usize);
+                            let r_start = usize::cast_from(scan[cell]);
+                            let r_end = usize::cast_from(scan[cell + 1]);
+                            for k in r_start..r_end {
+                                let j = usize::cast_from(list[k]);
+                                if j != i {
+                                    let pj = j * 4;
+                                    let dxx = pos[p] - pos[pj];
+                                    let dyy = pos[p + 1] - pos[pj + 1];
+                                    let dzz = pos[p + 2] - pos[pj + 2];
+                                    let r2 = dxx * dxx + dyy * dyy + dzz * dzz;
+                                    if r2 < support2 && r2 > F::new(1e-12_f32) {
+                                        let q = (r2).sqrt() / h;
+                                        let q2 = q * q;
+                                        let mut w = F::new(0.0_f32);
+                                        if q < F::new(1.0_f32) {
+                                            w = sigma * (F::new(1.0_f32) - F::new(1.5_f32) * q2 + F::new(0.75_f32) * q2 * q);
+                                        } else {
+                                            if q < F::new(2.0_f32) {
+                                                let t = F::new(2.0_f32) - q;
+                                                w = sigma * F::new(0.25_f32) * t * t * t;
+                                            }
+                                        }
+                                        let rho_bar = (state[p] + state[pj]) * F::new(0.5_f32);
+                                        let f = mass * w / rho_bar;
+                                        let vjx = vel[pj] + acc[pj] * ht;
+                                        let vjy = vel[pj + 1] + (acc[pj + 1] - gravity) * ht;
+                                        let vjz = vel[pj + 2] + acc[pj + 2] * ht;
+                                        avx = avx + f * (vjx - vx);
+                                        avy = avy + f * (vjy - vy);
+                                        avz = avz + f * (vjz - vz);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    delta[p] = avx;
+    delta[p + 1] = avy;
+    delta[p + 2] = avz;
+    delta[p + 3] = F::new(0.0_f32);
+}
+
+
 /// Velocity-Verlet half step + boundary contact. Gravity is applied here (y-down is
 /// negative). `vel_half = vel + (acc - g)*dt/2`, `pos_new = pos + vel_half*dt`, with
-/// world walls and heightfield-terrain push-out + normal projection.
+/// world walls and heightfield-terrain push-out + normal projection. `delta` is the
+/// XSPH velocity increment from `xsph_pass` (applied only when `xsph > 0`).
 #[cube(launch_unchecked)]
 pub(super) fn integrate_half<F: Float + LaunchArg>(
     pos_in: &[F],
     vel_in: &[F],
     acc_in: &[F],
-    state: &[F],
+    delta: &[F],
     pos_out: &mut [F],
     vel_half: &mut [F],
     terrain: &[F],
@@ -936,11 +1126,8 @@ pub(super) fn integrate_half<F: Float + LaunchArg>(
     gravity: F,
     domain_size: F,
     friction: F,
-    mass: F,
     xsph: F,
     h: F,
-    h2: F,
-    sigma: F,
     tx: usize,
     ty: usize,
     num: usize,
@@ -957,77 +1144,14 @@ pub(super) fn integrate_half<F: Float + LaunchArg>(
     let mut vy = vel_in[p + 1] + (acc_in[p + 1] - gravity) * ht;
     let mut vz = vel_in[p + 2] + acc_in[p + 2] * ht;
 
-    // XSPH (Monaghan): advect with a velocity-smoothed v-bar. Uses only read-only inputs
-    // (vel_in + acc) so there is no race; this damps the pairwise noise/slosh that leaves
-    // WCSPH columns jittering. Disabled when xsph == 0.
+    // XSPH (Monaghan): advect with the velocity-smoothed v-bar. The neighbor sum itself
+    // lives in `xsph_pass` (a separate kernel so this one stays under the wgpu
+    // 8-storage-buffer limit); this only applies the precomputed increment, guarded so a
+    // stale/zero delta is inert when xsph == 0.
     if xsph > F::new(0.0_f32) {
-        let support2 = F::new(4.0_f32) * h2;
-        let mut avx = F::new(0.0_f32);
-        let mut avy = F::new(0.0_f32);
-        let mut avz = F::new(0.0_f32);
-        for j in 0..num {
-            if j != i {
-                let pj = j * 4;
-                let mut dxx = pos_in[p] - pos_in[pj];
-                let dyy = pos_in[p + 1] - pos_in[pj + 1];
-                let mut dzz = pos_in[p + 2] - pos_in[pj + 2];
-                if periodic == 1 {
-                    let half = domain_size * F::new(0.5_f32);
-                    if dxx > half {
-                        dxx = dxx - domain_size;
-                    }
-                    if dxx < -half {
-                        dxx = dxx + domain_size;
-                    }
-                    if dzz > half {
-                        dzz = dzz - domain_size;
-                    }
-                    if dzz < -half {
-                        dzz = dzz + domain_size;
-                    }
-                }
-                if periodic == 2 {
-                    let half = domain_size * F::new(0.5_f32);
-                    if dxx > half {
-                        dxx = dxx - domain_size;
-                    }
-                    if dxx < -half {
-                        dxx = dxx + domain_size;
-                    }
-                    if dzz > half {
-                        dzz = dzz - domain_size;
-                    }
-                    if dzz < -half {
-                        dzz = dzz + domain_size;
-                    }
-                }
-                let r2 = dxx * dxx + dyy * dyy + dzz * dzz;
-                if r2 < support2 && r2 > F::new(1e-12_f32) {
-                    let q = (r2).sqrt() / h;
-                    let q2 = q * q;
-                    let mut w = F::new(0.0_f32);
-                    if q < F::new(1.0_f32) {
-                        w = sigma * (F::new(1.0_f32) - F::new(1.5_f32) * q2 + F::new(0.75_f32) * q2 * q);
-                    } else {
-                        if q < F::new(2.0_f32) {
-                            let t = F::new(2.0_f32) - q;
-                            w = sigma * F::new(0.25_f32) * t * t * t;
-                        }
-                    }
-                    let rho_bar = (state[p] + state[pj]) * F::new(0.5_f32);
-                    let f = mass * w / rho_bar;
-                    let vjx = vel_in[pj] + acc_in[pj] * ht;
-                    let vjy = vel_in[pj + 1] + (acc_in[pj + 1] - gravity) * ht;
-                    let vjz = vel_in[pj + 2] + acc_in[pj + 2] * ht;
-                    avx = avx + f * (vjx - vx);
-                    avy = avy + f * (vjy - vy);
-                    avz = avz + f * (vjz - vz);
-                }
-            }
-        }
-        vx = vx + xsph * avx;
-        vy = vy + xsph * avy;
-        vz = vz + xsph * avz;
+        vx = vx + xsph * delta[p];
+        vy = vy + xsph * delta[p + 1];
+        vz = vz + xsph * delta[p + 2];
     }
 
     let mut x = pos_in[p] + vx * dt;
@@ -1198,7 +1322,7 @@ pub(super) fn finish_verlet<F: Float + LaunchArg>(
 
 /// Zero out the integer per-cell counters (one launch, one workgroup thread per cell).
 #[cube(launch_unchecked)]
-fn splat_clear<I: Int + LaunchArg>(splat: &mut [I], cells: usize) {
+pub(super) fn splat_clear<I: Int + LaunchArg>(splat: &mut [I], cells: usize) {
     let i = ABSOLUTE_POS_X as usize;
     if i >= cells * cells {
         terminate!();
@@ -1208,7 +1332,7 @@ fn splat_clear<I: Int + LaunchArg>(splat: &mut [I], cells: usize) {
 
 /// Scatter particles into cells: increment the per-cell counter with an integer atomic.
 #[cube(launch_unchecked)]
-fn particle_to_splat<I: Int + LaunchArg, F: Float + LaunchArg>(
+pub(super) fn particle_to_splat<I: Int + LaunchArg, F: Float + LaunchArg>(
     pos: &[F],
     atomics: &[Atomic<I>],
     domain_size: F,
@@ -1240,7 +1364,7 @@ fn particle_to_splat<I: Int + LaunchArg, F: Float + LaunchArg>(
 /// Convert per-cell counts into the `Rgba32Float` texel stream shown by the overlay
 /// ([min(count / scale, 1), 0, 0, 0]).
 #[cube(launch_unchecked)]
-fn counts_to_texels<I: Int + LaunchArg, F: Float + LaunchArg>(
+pub(super) fn counts_to_texels<I: Int + LaunchArg, F: Float + LaunchArg>(
     counts: &[I],
     texels: &mut [F],
     scale: F,
@@ -1267,7 +1391,7 @@ fn counts_to_texels<I: Int + LaunchArg, F: Float + LaunchArg>(
 /// Height is encoded as `u32(f32::min(y, ...) * 1000)` (mm resolution) so the atomic
 /// max can use integer atomics (float atomics are rejected by naga/wgpu-30).
 #[cube(launch_unchecked)]
-fn surface_clear<I: Int + LaunchArg>(maxes: &mut [I], n: usize) {
+pub(super) fn surface_clear<I: Int + LaunchArg>(maxes: &mut [I], n: usize) {
     let i = ABSOLUTE_POS_X as usize;
     if i < n {
         maxes[i] = I::new(0);
@@ -1275,7 +1399,7 @@ fn surface_clear<I: Int + LaunchArg>(maxes: &mut [I], n: usize) {
 }
 
 #[cube(launch_unchecked)]
-fn particle_to_surface<F: Float + LaunchArg, I: Int + LaunchArg>(
+pub(super) fn particle_to_surface<F: Float + LaunchArg, I: Int + LaunchArg>(
     pos: &[F],
     maxes: &[Atomic<I>],
     domain_size: F,
@@ -1305,7 +1429,7 @@ fn particle_to_surface<F: Float + LaunchArg, I: Int + LaunchArg>(
 /// Decode the max heights and write `[surface, depth, 0, 0]` texels (depth vs the
 /// bilinear terrain height at each cell center).
 #[cube(launch_unchecked)]
-fn surface_to_texels<F: Float + LaunchArg, I: Int + LaunchArg>(
+pub(super) fn surface_to_texels<F: Float + LaunchArg, I: Int + LaunchArg>(
     maxes: &[I],
     terrain: &[F],
     texels: &mut [F],
@@ -1588,6 +1712,39 @@ pub(super) fn sph_substep(
         params,
     );
 
+    // XSPH neighbor sum at the current positions, then the half integration applying it.
+    // `xsph_pass` runs right after the force pass so it reuses the grid just built (the
+    // dense path scans all pairs — the CPU/perodic-test route, where no grid exists).
+    unsafe {
+        xsph_pass::launch_unchecked::<f32, u32>(
+            client,
+            CubeCount::Static(p.num.div_ceil(dim as usize) as u32, 1, 1),
+            CubeDim::new_1d(dim),
+            BufferArg::from_raw_parts(pos_in.clone(), p.num * 4),
+            BufferArg::from_raw_parts(vel_in.clone(), p.num * 4),
+            BufferArg::from_raw_parts(acc_scratch.clone(), p.num * 4),
+            BufferArg::from_raw_parts(state_scratch.clone(), p.num * 4),
+            BufferArg::from_raw_parts(p.grid_scan.clone(), p.cells_x * p.cells_y * p.cells_z + 1),
+            BufferArg::from_raw_parts(p.grid_list.clone(), p.num),
+            BufferArg::from_raw_parts(p.xsph_delta.clone(), p.num * 4),
+            dt,
+            gravity,
+            domain,
+            mass,
+            xsph,
+            h,
+            h2,
+            sigma,
+            p.cell_inv,
+            p.cells_x,
+            p.cells_y,
+            p.cells_z,
+            p.num,
+            neighbor as u32,
+            boundary as u32,
+        );
+    }
+
     // Half integration. `vel_out` now holds v^{n+1/2}.
     unsafe {
         integrate_half::launch_unchecked::<f32>(
@@ -1597,7 +1754,7 @@ pub(super) fn sph_substep(
             BufferArg::from_raw_parts(pos_in.clone(), p.num * 4),
             BufferArg::from_raw_parts(vel_in.clone(), p.num * 4),
             BufferArg::from_raw_parts(acc_scratch.clone(), p.num * 4),
-            BufferArg::from_raw_parts(state_scratch.clone(), p.num * 4),
+            BufferArg::from_raw_parts(p.xsph_delta.clone(), p.num * 4),
             BufferArg::from_raw_parts(pos_out.clone(), p.num * 4),
             BufferArg::from_raw_parts(vel_out.clone(), p.num * 4),
             BufferArg::from_raw_parts(p.terrain.clone(), p.terrain_x * p.terrain_y),
@@ -1605,11 +1762,8 @@ pub(super) fn sph_substep(
             gravity,
             domain,
             friction,
-            mass,
             xsph,
             h,
-            h2,
-            sigma,
             p.terrain_x,
             p.terrain_y,
             p.num,
@@ -1723,6 +1877,7 @@ pub fn setup_water(
     let rho_prev = client.empty((num * 4) * core::mem::size_of::<f32>());
     let acc_a = client.empty((num * 4) * core::mem::size_of::<f32>());
     let acc_b = client.empty((num * 4) * core::mem::size_of::<f32>());
+    let xsph_delta = client.empty((num * 4) * core::mem::size_of::<f32>());
     client.write(&pos_a, bytes(&pos));
     client.write(&vel_a, bytes(&vel));
     client.write(
@@ -1767,6 +1922,7 @@ pub fn setup_water(
         rho_prev,
         acc_a,
         acc_b,
+        xsph_delta,
         terrain: terrain_handle,
         terrain_x: terrain_size.x,
         terrain_y: terrain_size.y,
