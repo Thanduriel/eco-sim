@@ -9,16 +9,13 @@
 //!
 //! All state stays on the GPU via cubecl on Bevy's device (see `gpu.rs`).
 //!
-//! Neighbor search: the *physics* kernels take a `use_grid` switch. Production runs
-//! `use_grid = 1` (uniform-grid cell lists built with integer atomics: zero -> count ->
-//! prefix -> scatter). The grid was DISABLED for a long time because of reported
-//! cubecl-wgpu scatter nondeterminism, but the root cause was a plain logic bug: the
-//! scatter atomically incremented the counts buffer *without re-zeroing it* (the count
-//! pass and the prefix pass both use it), so every cell's slots started at count(cell)
-//! and the whole list landed one count late. The atomics themselves were always fine
-//! (verified by `grid_cell_lists_are_consistent_on_gpu`, now enabled and passing).
-//! `use_grid = 0` (dense all-pairs) remains the CPU-runtime test path (the cubecl CPU
-//! runtime has no atomics).
+//! Neighbor search: the *physics* kernels take a `NeighborSearch` switch. Production
+//! runs `UniformGrid` (cell lists built with integer atomics: zero -> count -> prefix ->
+//! scatter); `Dense` (all-pairs) remains the CPU-runtime test path (the cubecl CPU
+//! runtime has no atomics). The scatter must atomically claim slots against a *zeroed*
+//! counter array — the count pass leaves the counters at the per-cell totals, so the
+//! scatter re-zeros them first (see `build_grid`). `grid_cell_lists_are_consistent_on_gpu`
+//! pins the count/prefix/scatter invariant on the GPU.
 
 use bevy::prelude::*;
 use cubecl::prelude::*;
@@ -27,6 +24,124 @@ use cubecl::server::Handle;
 use crate::gpu;
 use crate::parameters;
 use crate::terrain;
+
+/// Boundary model of the domain. Kernels receive the `u32` discriminant (cubecl kernel
+/// arguments must be plain values, so the enum is the host-side spelling of those codes).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(u32)]
+#[allow(dead_code)] // FullPeriodic/PeriodicXZFloor are constructed by the analytic tests
+pub enum BoundaryMode {
+    /// Closed box: four walls + terrain, no wraparound (production).
+    #[default]
+    Closed = 0,
+    /// Fully periodic: all three axes wrap, no walls/terrain.
+    FullPeriodic = 1,
+    /// x/z wrap + hard floor at y = 0 (laterally infinite slab).
+    PeriodicXZFloor = 2,
+}
+
+/// Neighbor search strategy (kernels receive the `u32` discriminant).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(u32)]
+pub enum NeighborSearch {
+    /// Dense all-pairs loop. Kept for the CPU test runtime, which has no atomics.
+    #[default]
+    Dense = 0,
+    /// Uniform grid built with integer atomics (production).
+    UniformGrid = 1,
+}
+
+/// Analytic half-space density correction at solid boundaries (1/0 in the old naming;
+/// the kernel used to be called `floor_ghosts` for a ghost-particle scheme that was
+/// since replaced — the parameter activates the current correction, not ghosts).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(u32)]
+pub enum BoundaryCorrection {
+    #[default]
+    Off = 0,
+    On = 1,
+}
+
+/// Compute workgroup size used for every launch (matches the 1-D `CubeDim`).
+const LAUNCH_DIM: u32 = 64;
+
+/// SPH fluid + integration parameters for one force pass / substep. The kernels were
+/// getting ~25 positional arguments; this groups the physics constants (derived once per
+/// tick from `WaterParameters`, or per test from the Rig's calibrated values). `dt` stays
+/// a separate argument (it is a timestep, not a fluid property).
+#[derive(Clone, Copy)]
+pub struct SphParams {
+    /// Smoothing length h (m).
+    pub h: f32,
+    /// h².
+    pub h2: f32,
+    /// Cubic-spline normalization 1/(π h³).
+    pub sigma: f32,
+    /// Particle mass (kg).
+    pub mass: f32,
+    /// Rest density ρ₀ (kg/m³).
+    pub rho0: f32,
+    /// EoS clamp: minimum density fraction (1.0 = no tension, < 1 allows bounded
+    /// tension so a free surface can hold itself).
+    pub rho_min_frac: f32,
+    /// Tait EoS stiffness B = ρ₀ c₀² / γ (Pa).
+    pub b: f32,
+    /// Tait isentropic exponent γ.
+    pub gamma: f32,
+    /// Monaghan artificial viscosity coefficient α.
+    pub alpha: f32,
+    /// Reference sound speed c₀ (m/s).
+    pub speed_of_sound: f32,
+    /// Neighbor search strategy.
+    pub neighbor: NeighborSearch,
+    /// Domain box side length (m).
+    pub domain: f32,
+    /// External gravity (m/s², y-down in the integrator).
+    pub gravity: f32,
+    /// Tangential damping on terrain contact.
+    pub friction: f32,
+    /// Boundary model of the domain.
+    pub boundary: BoundaryMode,
+    /// Analytic half-space density correction at solid boundaries.
+    pub correction: BoundaryCorrection,
+    /// XSPH velocity-smoothing coefficient (0 = off).
+    pub xsph: f32,
+    /// delta-SPH density diffusion coefficient δ (0 = off).
+    pub diffusion: f32,
+}
+
+impl SphParams {
+    /// Production pipeline: derives the SPH constants from the F4 tunables. The neighbor
+    /// search, boundary model and correction are the production choices (the analytic
+    /// tests configure these explicitly).
+    pub fn from_water_parameters(
+        wp: &parameters::WaterParameters,
+        spacing: f32,
+        domain: f32,
+    ) -> Self {
+        let h = spacing * wp.smoothing_ratio;
+        Self {
+            h,
+            h2: h * h,
+            sigma: 1.0 / (core::f32::consts::PI * h * h * h),
+            mass: wp.fluid_density * spacing * spacing * spacing,
+            rho0: wp.fluid_density,
+            rho_min_frac: 1.0,
+            b: wp.fluid_density * wp.sound_speed * wp.sound_speed / wp.gamma,
+            gamma: wp.gamma,
+            alpha: wp.viscosity_alpha,
+            speed_of_sound: wp.sound_speed,
+            neighbor: NeighborSearch::UniformGrid,
+            domain,
+            gravity: 9.81,
+            friction: wp.terrain_friction,
+            boundary: BoundaryMode::Closed,
+            correction: BoundaryCorrection::On,
+            xsph: wp.xsph,
+            diffusion: wp.diffusion,
+        }
+    }
+}
 
 /// Persistent GPU water state (double-buffered for ping-pong between steps).
 #[derive(Resource)]
@@ -114,8 +229,6 @@ fn grid_count<F: Float + LaunchArg, I: Int + LaunchArg>(
     pos: &[F],
     counts: &[Atomic<I>],
     cell_inv: F,
-    _domain_size: F,
-    _max_y: F,
     cx: usize,
     cy: usize,
     cz: usize,
@@ -231,7 +344,6 @@ fn grid_scatter<F: Float + LaunchArg, I: Int + LaunchArg>(
     counts: &[Atomic<I>],
     list: &mut [I],
     cell_inv: F,
-    _max_y: F,
     cx: usize,
     cy: usize,
     cz: usize,
@@ -294,9 +406,9 @@ fn compute_density<F: Float + LaunchArg, I: Int + LaunchArg>(
     cy: usize,
     cz: usize,
     num: usize,
-    use_grid: i32,
-    periodic: i32,
-    floor_ghosts: i32,
+    use_grid: u32,
+    periodic: u32,
+    floor_ghosts: u32,
 ) {
     let i = ABSOLUTE_POS_X as usize;
     if i >= num {
@@ -403,12 +515,12 @@ fn compute_density<F: Float + LaunchArg, I: Int + LaunchArg>(
         let icy = usize::cast_from(y) as i32;
         let icz = usize::cast_from(z) as i32;
 
-        for cdz in 0..3usize {
-            for cdy in 0..3usize {
-                for cdx in 0..3usize {
-                    let nc = icx + (cdx as i32 - 1);
-                    let nr = icy + (cdy as i32 - 1);
-                    let nh = icz + (cdz as i32 - 1);
+        for cdz in 0..3i32 {
+            for cdy in 0..3i32 {
+                for cdx in 0..3i32 {
+                    let nc = icx + (cdx - 1);
+                    let nr = icy + (cdy - 1);
+                    let nh = icz + (cdz - 1);
                     if nc >= 0 && nc < cx as i32 && nr >= 0 && nr < cy as i32
                         && nh >= 0 && nh < cz as i32
                     {
@@ -615,8 +727,8 @@ fn compute_force<F: Float + LaunchArg, I: Int + LaunchArg>(
     cy: usize,
     cz: usize,
     num: usize,
-    use_grid: i32,
-    periodic: i32,
+    use_grid: u32,
+    periodic: u32,
 ) {
     let i = ABSOLUTE_POS_X as usize;
     if i >= num {
@@ -737,12 +849,12 @@ fn compute_force<F: Float + LaunchArg, I: Int + LaunchArg>(
         let icy = usize::cast_from(y) as i32;
         let icz = usize::cast_from(z) as i32;
 
-        for cdz in 0..3usize {
-            for cdy in 0..3usize {
-                for cdx in 0..3usize {
-                    let nc = icx + (cdx as i32 - 1);
-                    let nr = icy + (cdy as i32 - 1);
-                    let nh = icz + (cdz as i32 - 1);
+        for cdz in 0..3i32 {
+            for cdy in 0..3i32 {
+                for cdx in 0..3i32 {
+                    let nc = icx + (cdx - 1);
+                    let nr = icy + (cdy - 1);
+                    let nh = icz + (cdz - 1);
                     if nc >= 0 && nc < cx as i32 && nr >= 0 && nr < cy as i32
                         && nh >= 0 && nh < cz as i32
                     {
@@ -830,7 +942,7 @@ fn integrate_half<F: Float + LaunchArg>(
     tx: usize,
     ty: usize,
     num: usize,
-    periodic: i32,
+    periodic: u32,
 ) {
     let i = ABSOLUTE_POS_X as usize;
     if i >= num {
@@ -1264,29 +1376,28 @@ fn surface_to_texels<F: Float + LaunchArg, I: Int + LaunchArg>(
 /// re-zero every cell's slots start at count(cell) and the list lands one count late —
 /// the historical "cubecl-wgpu scatter nondeterminism".
 fn build_grid(client: &Client, p: &WaterParticles, pos: &Handle) {
-    let dim = 64u32;
+    let dim = LAUNCH_DIM;
+    // Number of 64-thread workgroups needed for `n` parallel items.
+    let wgs = |n: usize| n.div_ceil(dim as usize) as u32;
     let cells = p.cells_x * p.cells_y * p.cells_z;
     let cell_inv = p.cell_inv;
-    let max_y = p.cells_y as f32 * (1.0 / cell_inv);
     let treads = 64usize; // cells per block; one thread sums one block's 64 counts
     let nblocks = cells.div_ceil(treads);
     unsafe {
         grid_zero::launch_unchecked::<u32>(
             client,
-            CubeCount::Static(cells.div_ceil(dim as usize) as u32, 1, 1),
+            CubeCount::Static(wgs(cells), 1, 1),
             CubeDim::new_1d(dim),
             BufferArg::from_raw_parts(p.grid_counts.clone(), cells),
             cells,
         );
         grid_count::launch_unchecked::<f32, u32>(
             client,
-            CubeCount::Static(p.num.div_ceil(dim as usize) as u32, 1, 1),
+            CubeCount::Static(wgs(p.num), 1, 1),
             CubeDim::new_1d(dim),
             BufferArg::from_raw_parts(pos.clone(), p.num * 4),
             BufferArg::from_raw_parts(p.grid_counts.clone(), cells),
             cell_inv,
-            crate::domain::SIZE_F32.x,
-            max_y,
             p.cells_x,
             p.cells_y,
             p.cells_z,
@@ -1297,7 +1408,7 @@ fn build_grid(client: &Client, p: &WaterParticles, pos: &Handle) {
         // = ~52 ms/tick). Block totals (all parallel) -> tiny block prefix -> inner scan.
         grid_block_totals::launch_unchecked::<u32>(
             client,
-            CubeCount::Static(nblocks.div_ceil(dim as usize) as u32, 1, 1),
+            CubeCount::Static(wgs(nblocks), 1, 1),
             CubeDim::new_1d(dim),
             BufferArg::from_raw_parts(p.grid_counts.clone(), cells),
             BufferArg::from_raw_parts(p.grid_totals.clone(), nblocks),
@@ -1315,7 +1426,7 @@ fn build_grid(client: &Client, p: &WaterParticles, pos: &Handle) {
         );
         grid_inner_scan::launch_unchecked::<u32>(
             client,
-            CubeCount::Static(cells.div_ceil(dim as usize) as u32, 1, 1),
+            CubeCount::Static(wgs(cells), 1, 1),
             CubeDim::new_1d(dim),
             BufferArg::from_raw_parts(p.grid_counts.clone(), cells),
             BufferArg::from_raw_parts(p.grid_offsets.clone(), nblocks + 1),
@@ -1323,30 +1434,30 @@ fn build_grid(client: &Client, p: &WaterParticles, pos: &Handle) {
             cells,
             treads,
         );
-        // The scatter's `counts[cell].fetch_add` must start from 0: `grid_count` left
-        // the counts at their full values and the scan only *read* them, so without
-        // re-zeroing every cell's atomics start at count(cell) and the whole list
-        // lands one count late (`scan[cell] + count + slot`) — overlapping the next
-        // cell's range and leaving this range's head untouched (zeros -> "duplicate
-        // particle 0" in the invariant test). This was the real "cubecl-wgpu scatter
-        // nondeterminism" all along: the atomics were never wrong.
+        // The scatter claims each cell's slots by atomically incrementing `counts`, so
+        // the counters must be zero at this point: `grid_count` left them holding the
+        // per-cell totals and the scan passes only read them. Without the re-zero,
+        // every cell's slots would start at count(cell), shifting each range's entries
+        // one count into the next range and leaving the range heads untouched — which
+        // historically read as "cubecl-wgpu atomics are non-deterministic" (the
+        // invariant test failed on untouched zero entries) while the atomics were
+        // always correct.
         grid_zero::launch_unchecked::<u32>(
             client,
-            CubeCount::Static(cells.div_ceil(dim as usize) as u32, 1, 1),
+            CubeCount::Static(wgs(cells), 1, 1),
             CubeDim::new_1d(dim),
             BufferArg::from_raw_parts(p.grid_counts.clone(), cells),
             cells,
         );
         grid_scatter::launch_unchecked::<f32, u32>(
             client,
-            CubeCount::Static(p.num.div_ceil(dim as usize) as u32, 1, 1),
+            CubeCount::Static(wgs(p.num), 1, 1),
             CubeDim::new_1d(dim),
             BufferArg::from_raw_parts(pos.clone(), p.num * 4),
             BufferArg::from_raw_parts(p.grid_scan.clone(), cells + 1),
             BufferArg::from_raw_parts(p.grid_counts.clone(), cells),
             BufferArg::from_raw_parts(p.grid_list.clone(), p.num),
             cell_inv,
-            max_y,
             p.cells_x,
             p.cells_y,
             p.cells_z,
@@ -1366,23 +1477,14 @@ fn sph_force_pass(
     state: &Handle,
     acc: &Handle,
     rho_prev: &Handle,
-    h: f32,
-    h2: f32,
-    sigma: f32,
-    mass: f32,
-    rho0: f32,
-    rho_min_frac: f32,
-    b: f32,
-    gamma: f32,
-    alpha: f32,
-    speed_of_sound: f32,
-    use_grid: i32,
-    domain: f32,
-    periodic: i32,
-    floor_ghosts: i32,
-    diffusion: f32,
+    params: SphParams,
 ) {
-    let dim = 64u32;
+    // Destructure once so the kernel bodies keep reading the short, familiar names.
+    let SphParams {
+        h, h2, sigma, mass, rho0, rho_min_frac, b, gamma, alpha, speed_of_sound, neighbor,
+        domain, boundary, correction, diffusion, ..
+    } = params;
+    let dim = LAUNCH_DIM;
     let cells = p.cells_x * p.cells_y * p.cells_z;
     let cell_inv = p.cell_inv;
     unsafe {
@@ -1413,9 +1515,9 @@ fn sph_force_pass(
             p.cells_y,
             p.cells_z,
             p.num,
-            use_grid,
-            periodic,
-            floor_ghosts,
+            neighbor as u32,
+            boundary as u32,
+            correction as u32,
         );
         compute_force::launch_unchecked::<f32, u32>(
             client,
@@ -1439,8 +1541,8 @@ fn sph_force_pass(
             p.cells_y,
             p.cells_z,
             p.num,
-            use_grid,
-            periodic,
+            neighbor as u32,
+            boundary as u32,
         );
     }
 }
@@ -1457,31 +1559,20 @@ fn sph_substep(
     vel_out: &Handle,
     state_scratch: &Handle,
     acc_scratch: &Handle,
-    dt: f32,
-    h: f32,
-    mass: f32,
-    rho0: f32,
-    rho_min_frac: f32,
-    b: f32,
-    gamma: f32,
-    alpha: f32,
-    speed_of_sound: f32,
-    use_grid: i32,
-    gravity: f32,
-    friction: f32,
-    domain: f32,
-    periodic: i32,
-    floor_ghosts: i32,
-    xsph: f32,
     rho_prev: &Handle,
-    diffusion: f32,
+    dt: f32,
+    params: SphParams,
 ) {
-    let dim = 64u32;
-    let h2 = h * h;
-    let sigma = 1.0 / (core::f32::consts::PI * h * h * h);
+    // Destructure once so the kernel bodies keep reading the short, familiar names.
+    // (The EoS coefficients and the diffusion term are consumed by the force passes via
+    // `params`, not here — they are only part of the integration inputs.)
+    let SphParams {
+        h, h2, sigma, mass, neighbor, domain, gravity, friction, boundary, xsph, ..
+    } = params;
+    let dim = LAUNCH_DIM;
 
     // Force at the current positions.
-    if use_grid == 1 {
+    if neighbor == NeighborSearch::UniformGrid {
         build_grid(client, p, pos_in);
     }
     sph_force_pass(
@@ -1492,21 +1583,7 @@ fn sph_substep(
         state_scratch,
         acc_scratch,
         rho_prev,
-        h,
-        h2,
-        sigma,
-        mass,
-        rho0,
-        rho_min_frac,
-        b,
-        gamma,
-        alpha,
-        speed_of_sound,
-        use_grid,
-        domain,
-        periodic,
-        floor_ghosts,
-        diffusion,
+        params,
     );
 
     // Half integration. `vel_out` now holds v^{n+1/2}.
@@ -1534,12 +1611,12 @@ fn sph_substep(
             p.terrain_x,
             p.terrain_y,
             p.num,
-            periodic,
+            boundary as u32,
         );
     }
 
     // Force at the new positions.
-    if use_grid == 1 {
+    if neighbor == NeighborSearch::UniformGrid {
         build_grid(client, p, pos_out);
     }
     sph_force_pass(
@@ -1550,21 +1627,7 @@ fn sph_substep(
         state_scratch,
         acc_scratch,
         rho_prev,
-        h,
-        h2,
-        sigma,
-        mass,
-        rho0,
-        rho_min_frac,
-        b,
-        gamma,
-        alpha,
-        speed_of_sound,
-        use_grid,
-        domain,
-        periodic,
-        floor_ghosts,
-        diffusion,
+        params,
     );
 
     // Finish the Verlet step in place (`vel_out` = v^{n+1}).
@@ -1725,6 +1788,17 @@ pub fn setup_water(
 
 /// Phase 2 main loop: `substeps` fixed velocity-Verlet steps per physics tick, then refresh
 /// the debug splat and publish the buffer for rendering.
+/// Raw GPU buffer and its byte offset backing a cubecl handle, so the render world can
+/// copy from it directly (`WgpuServer` keeps the cubecl buffer alive via the handle).
+/// Panics if the handle is gone — the sim structures must keep it referenced.
+fn gpu_buffer_of(client: &Client, handle: &Handle) -> (cubecl::wgpu::wgpu::Buffer, u64) {
+    let managed = client
+        .get_resource::<cubecl::wgpu::WgpuServer<cubecl::wgpu::AutoCompiler>>(handle.clone())
+        .expect("cubecl buffer should still be alive");
+    let resource = managed.resource();
+    (resource.buffer.clone(), resource.offset)
+}
+
 pub fn run_water(
     params: Res<parameters::GeneralParameters>,
     gpu_context: Res<gpu::GpuContext>,
@@ -1753,15 +1827,14 @@ pub fn run_water(
     }
 
 
-    let dt =
-        1.0 / parameters::PHYSICS_TICKS_PER_SEC as f32 / wp.substeps.max(1) as f32;
-    let s = wp.particle_spacing;
-    let h = s * wp.smoothing_ratio;
-    let mass = wp.fluid_density * s * s * s;
-    let b = wp.fluid_density * wp.sound_speed * wp.sound_speed / wp.gamma;
-    let dim = 64u32;
-
     let sub = wp.substeps.max(1);
+    let dt =
+        1.0 / parameters::PHYSICS_TICKS_PER_SEC as f32 / sub as f32;
+    let s = wp.particle_spacing;
+    let sph = SphParams::from_water_parameters(wp, s, crate::domain::SIZE_F32.x);
+    let dim = LAUNCH_DIM;
+    let cells_sq = p.cells * p.cells;
+
     for _ in 0..sub {
         let use_b = p.current_is_b;
         let (pos_in, vel_in, pos_out, vel_out, state_scratch, acc_scratch) = if use_b {
@@ -1778,24 +1851,9 @@ pub fn run_water(
             vel_out,
             state_scratch,
             acc_scratch,
-            dt,
-            h,
-            mass,
-            wp.fluid_density,
-            1.0,
-            b,
-            wp.gamma,
-            wp.viscosity_alpha,
-            wp.sound_speed,
-            1, // GRID neighbor search (dense all-pairs caps at ~2.3k particles)
-            9.81_f32,
-            wp.terrain_friction,
-            crate::domain::SIZE_F32.x,
-            0,
-            1, // terrain-aware half-space density correction (bilinear height)
-            wp.xsph,
             &p.rho_prev,
-            wp.diffusion,
+            dt,
+            sph,
         );
         p.current_is_b = !use_b;
     }
@@ -1808,9 +1866,9 @@ pub fn run_water(
     unsafe {
         splat_clear::launch_unchecked::<u32>(
             client,
-            CubeCount::Static((p.cells * p.cells).div_ceil(dim as usize) as u32, 1, 1),
+            CubeCount::Static(cells_sq.div_ceil(dim as usize) as u32, 1, 1),
             CubeDim::new_1d(dim),
-            BufferArg::from_raw_parts(p.splat_counts.clone(), p.cells * p.cells),
+            BufferArg::from_raw_parts(p.splat_counts.clone(), cells_sq),
             p.cells,
         );
         particle_to_splat::launch_unchecked::<u32, f32>(
@@ -1825,21 +1883,18 @@ pub fn run_water(
         );
         counts_to_texels::launch_unchecked::<u32, f32>(
             client,
-            CubeCount::Static((p.cells * p.cells).div_ceil(dim as usize) as u32, 1, 1),
+            CubeCount::Static(cells_sq.div_ceil(dim as usize) as u32, 1, 1),
             CubeDim::new_1d(dim),
-            BufferArg::from_raw_parts(p.splat_counts.clone(), p.cells * p.cells),
-            BufferArg::from_raw_parts(p.splat.clone(), p.cells * p.cells * 4),
+            BufferArg::from_raw_parts(p.splat_counts.clone(), cells_sq),
+            BufferArg::from_raw_parts(p.splat.clone(), cells_sq * 4),
             wp.debug_count_scale,
             p.cells,
         );
     }
 
-    let managed = client
-        .get_resource::<cubecl::wgpu::WgpuServer<cubecl::wgpu::AutoCompiler>>(p.splat.clone())
-        .expect("cubecl buffer should still be alive");
-    let resource = managed.resource();
-    field_vis_gpu.water.buffer = Some(resource.buffer.clone());
-    field_vis_gpu.water.offset = resource.offset;
+    let (water_buf, water_off) = gpu_buffer_of(client, &p.splat);
+    field_vis_gpu.water.buffer = Some(water_buf);
+    field_vis_gpu.water.offset = water_off;
     field_vis_gpu.water.width = p.cells as u32;
     field_vis_gpu.water.height = p.cells as u32;
     if field_vis_gpu.image != terrain_assets.field_vis_image {
@@ -1848,12 +1903,9 @@ pub fn run_water(
 
     // Phase 4: publish the current particle positions (the sprite layer reads them via
     // `gpu::copy_particles_to_shader_buffer`; the ping-pong buffers hold the same data).
-    let pos_managed = client
-        .get_resource::<cubecl::wgpu::WgpuServer<cubecl::wgpu::AutoCompiler>>(cur_pos.clone())
-        .expect("cubecl buffer should still be alive");
-    let pos_resource = pos_managed.resource();
-    field_vis_gpu.particles.buffer = Some(pos_resource.buffer.clone());
-    field_vis_gpu.particles.offset = pos_resource.offset;
+    let (particle_buf, particle_off) = gpu_buffer_of(client, cur_pos);
+    field_vis_gpu.particles.buffer = Some(particle_buf);
+    field_vis_gpu.particles.offset = particle_off;
     field_vis_gpu.particles.count = p.num as u32;
 
     // Phase 3 surface: clear the per-cell max, scatter particle heights (integer atomic
@@ -1863,10 +1915,10 @@ pub fn run_water(
     unsafe {
         surface_clear::launch_unchecked::<u32>(
             client,
-            CubeCount::Static((p.cells * p.cells).div_ceil(dim as usize) as u32, 1, 1),
+            CubeCount::Static(cells_sq.div_ceil(dim as usize) as u32, 1, 1),
             CubeDim::new_1d(dim),
-            BufferArg::from_raw_parts(p.surface_max.clone(), p.cells * p.cells),
-            p.cells * p.cells,
+            BufferArg::from_raw_parts(p.surface_max.clone(), cells_sq),
+            cells_sq,
         );
         particle_to_surface::launch_unchecked::<f32, u32>(
             client,
@@ -1891,12 +1943,9 @@ pub fn run_water(
             p.terrain_y,
         );
     }
-    let managed = client
-        .get_resource::<cubecl::wgpu::WgpuServer<cubecl::wgpu::AutoCompiler>>(p.surface.clone())
-        .expect("cubecl buffer should still be alive");
-    let resource = managed.resource();
-    field_vis_gpu.surface.buffer = Some(resource.buffer.clone());
-    field_vis_gpu.surface.offset = resource.offset;
+    let (surface_buf, surface_off) = gpu_buffer_of(client, &p.surface);
+    field_vis_gpu.surface.buffer = Some(surface_buf);
+    field_vis_gpu.surface.offset = surface_off;
     field_vis_gpu.surface.width = p.cells as u32;
     field_vis_gpu.surface.height = p.cells as u32;
     field_vis_gpu.surface_image = terrain_assets.water_surface_image.clone();
@@ -1997,8 +2046,8 @@ mod tests {
         alpha: f32,
         /// EoS reference sound speed (m/s).
         sound_speed: f32,
-        /// 1 = periodic domain (all axes wrap, no walls/terrain), 0 = closed box.
-        periodic: i32,
+        /// Boundary model of the domain.
+        boundary: BoundaryMode,
         /// Domain size (world side length).
         domain: f32,
         /// XSPH velocity-smoothing coefficient (0 = off).
@@ -2013,8 +2062,8 @@ mod tests {
         rho_min_frac: f32,
         /// Smoothing length as a multiple of the particle spacing.
         h_ratio: f32,
-        /// Implicit mirror ghost particles across the flat floor at y = 0.
-        floor_ghosts: i32,
+        /// Analytic half-space density correction at solid boundaries.
+        correction: BoundaryCorrection,
     }
 
     impl Rig {
@@ -2057,21 +2106,40 @@ mod tests {
                 friction: TERRAIN_FRICTION,
                 alpha: ALPHA,
                 sound_speed: SPEED_OF_SOUND,
-                periodic: 0,
+                boundary: BoundaryMode::Closed,
                 domain: 64.0,
                 xsph: 0.0,
                 diffusion: 0.0,
                 rest_density: RHO0,
                 rho_min_frac: 1.0,
                 h_ratio: 1.3,
-                floor_ghosts: 0,
+                correction: BoundaryCorrection::Off,
             }
         }
 
         fn step(&mut self, dt: f32, steps: usize, spacing: f32) {
             let h = spacing * self.h_ratio;
-            let mass = RHO0 * spacing * spacing * spacing;
-            let b = RHO0 * self.sound_speed * self.sound_speed / GAMMA;
+            let sph = SphParams {
+                h,
+                h2: h * h,
+                sigma: 1.0 / (core::f32::consts::PI * h * h * h),
+                mass: RHO0 * spacing * spacing * spacing,
+                rho0: self.rest_density,
+                rho_min_frac: self.rho_min_frac,
+                b: RHO0 * self.sound_speed * self.sound_speed / GAMMA,
+                gamma: GAMMA,
+                alpha: self.alpha,
+                speed_of_sound: self.sound_speed,
+                neighbor: NeighborSearch::Dense,
+                domain: self.domain,
+                gravity: self.gravity,
+                friction: self.friction,
+                boundary: self.boundary,
+                correction: self.correction,
+                xsph: self.xsph,
+                // The Rig's calibration scales δ by c₀·dt before passing it on.
+                diffusion: self.diffusion * dt * self.sound_speed,
+            };
             let p = WaterParticles {
                 num: self.num,
                 pos_a: self.pos_a.clone(),
@@ -2117,24 +2185,9 @@ mod tests {
                     vel_out,
                     &self.state,
                     &self.acc,
-                    dt,
-                    h,
-                    mass,
-                    self.rest_density,
-                    self.rho_min_frac,
-                    b,
-                    GAMMA,
-                    self.alpha,
-                    self.sound_speed,
-                    0,
-                    self.gravity,
-                    self.friction,
-                    self.domain,
-                    self.periodic,
-                    self.floor_ghosts,
-                    self.xsph,
                     &self.rho_prev,
-                    self.diffusion * dt * self.sound_speed,
+                    dt,
+                    sph,
                 );
                 self.use_b = !self.use_b;
             }
@@ -2172,7 +2225,7 @@ mod tests {
         let dt = 0.01;
         let n = 40;
         // acc = 0: run the integrator kernels alone.
-        let dim = 64u32;
+        let dim = LAUNCH_DIM;
         let mut use_b = false;
         for _ in 0..n {
             let (pi, vi, po, vo) = if use_b {
@@ -2327,8 +2380,8 @@ mod tests {
             }
         }
         let mut rig = Rig::new_with_client(client.clone(), &pos, &[0.0], 1, 1);
-        rig.periodic = 2; // x/z wrap + hard floor (laterally infinite slab)
-        rig.floor_ghosts = 1;
+        rig.boundary = BoundaryMode::PeriodicXZFloor; // x/z wrap + hard floor
+        rig.correction = BoundaryCorrection::On;
         rig.domain = l;
         rig.gravity = GRAVITY;
         rig.friction = 5.0;
@@ -2457,7 +2510,7 @@ mod tests {
         rig.alpha = 0.3;
         rig.rho_min_frac = 1.0;
         // Terrain-aware half-space density correction (bilinear height at each particle).
-        rig.floor_ghosts = 1;
+        rig.correction = BoundaryCorrection::On;
         let dt = 1.0 / 240.0;
         rig.step(dt, 1000, spacing);
 
@@ -2523,8 +2576,8 @@ mod tests {
             }
         }
         let mut rig = Rig::new_with_client(client.clone(), &pos, &terrain, gx, gx);
-        rig.periodic = 0; // closed box + terrain (production-like)
-        rig.floor_ghosts = 1;
+        rig.boundary = BoundaryMode::Closed; // closed box + terrain (production-like)
+        rig.correction = BoundaryCorrection::On;
         rig.domain = 64.0;
         rig.gravity = GRAVITY;
         rig.friction = 5.0;
@@ -2593,7 +2646,7 @@ mod tests {
         let mut rig = Rig::new_with_client(client.clone(), &pos, &[0.0], 1, 1);
         rig.gravity = 0.0;
         rig.friction = 0.0;
-        rig.periodic = 1;
+        rig.boundary = BoundaryMode::FullPeriodic;
         rig.domain = l;
         rig.alpha = 0.2;
 
@@ -2665,7 +2718,7 @@ mod tests {
         let mut rig = Rig::new_with_client(client.clone(), &pos, &[0.0], 1, 1);
         rig.gravity = 0.0;
         rig.friction = 0.0;
-        rig.periodic = 1;
+        rig.boundary = BoundaryMode::FullPeriodic;
         rig.domain = l;
         rig.alpha = 0.05;
 
@@ -2747,7 +2800,7 @@ mod tests {
         rig.alpha = 0.1;
         // WCSPH stiffness rule: c0 >= 10 * umax (u_max ~ 2*c0_ritter = 8.9 m/s).
         rig.sound_speed = 100.0;
-        rig.floor_ghosts = 1;
+        rig.correction = BoundaryCorrection::On;
         let c0 = (GRAVITY * h0).sqrt();
         let t_target = 0.4f32;
         let dt = 1.0 / 960.0;
@@ -2806,7 +2859,7 @@ mod tests {
         let mut rig = Rig::new_with_client(client.clone(), &pos, &[0.0], 1, 1);
         rig.gravity = 0.0;
         rig.friction = 0.0;
-        rig.periodic = 1;
+        rig.boundary = BoundaryMode::FullPeriodic;
         rig.domain = l;
         rig.alpha = 0.1;
 
@@ -3016,7 +3069,7 @@ mod tests {
         let num = nx * ny * nz;
         let (cx, cz) = (26.0f32, 26.0f32);
         let mut pos = Vec::with_capacity(num * 4);
-        let mut vel = vec![0.0f32; num * 4];
+        let vel = vec![0.0f32; num * 4];
         for y in 0..ny {
             for z in 0..nz {
                 for x in 0..nx {
@@ -3041,7 +3094,6 @@ mod tests {
         client.write(&state, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&s0).to_vec()));
         let acc = alloc(pos.len());
         let rho_prev = alloc(pos.len());
-        let terrain = alloc(1);
         let tn = client.empty(1 * core::mem::size_of::<f32>());
         let tdata = vec![0.0f32];
         client.write(&tn, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&tdata).to_vec()));
@@ -3075,8 +3127,27 @@ mod tests {
             cells: 1,
             current_is_b: false,
         };
-        let t0 = std::time::Instant::now();
         let dt = 1.0 / 60.0 / 4.0;
+        let sph = SphParams {
+            h,
+            h2: h * h,
+            sigma: 1.0 / (core::f32::consts::PI * h * h * h),
+            mass: 125.0,
+            rho0: 1000.0,
+            rho_min_frac: 1.0,
+            b: 1000.0 * 40.0 * 40.0 / 7.0,
+            gamma: 7.0,
+            alpha: 0.3,
+            speed_of_sound: 40.0,
+            neighbor: NeighborSearch::UniformGrid,
+            domain: 64.0,
+            gravity: 9.81,
+            friction: 3.0,
+            boundary: BoundaryMode::Closed,
+            correction: BoundaryCorrection::Off,
+            xsph: 0.2,
+            diffusion: 0.0,
+        };
         for st in 0..40usize {
 
             let (pa, va, pb, vb) = if st % 2 == 0 {
@@ -3093,27 +3164,11 @@ mod tests {
                 vb,
                 &p.state_a,
                 &p.acc_a,
-                dt,
-                h,
-                125.0,
-                1000.0,
-                1.0,
-                1000.0 * 40.0 * 40.0 / 7.0,
-                7.0,
-                0.3,
-                40.0,
-                1,
-                9.81,
-                3.0,
-                64.0,
-                0,
-                0,
-                0.2,
                 &p.rho_prev,
-                0.0,
+                dt,
+                sph,
             );
         }
-        let ms = t0.elapsed();
         let ab = client.read_one_unchecked(p.acc_a.clone());
         let a = f32::from_bytes(&ab);
         let mut max_a = 0.0f32;
@@ -3174,7 +3229,7 @@ mod tests {
             surface_max: ch.clone(), surface: ch.clone(),
             cells: 1, current_is_b: false,
         };
-        let dim = 64u32;
+        let dim = LAUNCH_DIM;
         unsafe {
             grid_block_totals::launch_unchecked::<u32>(
                 &client,
@@ -3265,7 +3320,7 @@ mod tests {
         rho_prev.extend_from_slice(&state);
         let alloc = |n: usize| client.empty(n * core::mem::size_of::<f32>());
         let alloc_u = |n: usize| client.empty(n * core::mem::size_of::<u32>());
-        let mk = |tag: u8| {
+        let mk = || {
             let pos_h = alloc(pos.len());
             let vel_h = alloc(vel.len());
             let st = alloc(state.len());
@@ -3309,20 +3364,40 @@ mod tests {
                 current_is_b: false,
             }
         };
-        let dense = mk(0);
-        let grid = mk(1);
+        let dense = mk();
+        let grid = mk();
         let dt = 1.0 / 60.0 / 4.0;
+        let sph_dense = SphParams {
+            h,
+            h2: h * h,
+            sigma: 1.0 / (core::f32::consts::PI * h * h * h),
+            mass: 125.0,
+            rho0: 1000.0,
+            rho_min_frac: 1.0,
+            b: 1000.0 * 40.0 * 40.0 / 7.0,
+            gamma: 7.0,
+            alpha: 0.3,
+            speed_of_sound: 40.0,
+            neighbor: NeighborSearch::Dense,
+            domain: 64.0,
+            gravity: 9.81,
+            friction: 3.0,
+            boundary: BoundaryMode::Closed,
+            correction: BoundaryCorrection::Off,
+            xsph: 0.2,
+            diffusion: 0.0,
+        };
+        let sph_grid = SphParams {
+            neighbor: NeighborSearch::UniformGrid,
+            ..sph_dense
+        };
         sph_substep(
             &client, &dense, &dense.pos_a, &dense.vel_a, &dense.pos_b, &dense.vel_b,
-            &dense.state_a, &dense.acc_a, dt, h, 125.0, 1000.0, 1.0,
-            1000.0 * 40.0 * 40.0 / 7.0, 7.0, 0.3, 40.0, 0, 9.81, 3.0, 64.0, 0, 0, 0.2,
-            &dense.rho_prev, 0.0,
+            &dense.state_a, &dense.acc_a, &dense.rho_prev, dt, sph_dense,
         );
         sph_substep(
             &client, &grid, &grid.pos_a, &grid.vel_a, &grid.pos_b, &grid.vel_b,
-            &grid.state_a, &grid.acc_a, dt, h, 125.0, 1000.0, 1.0,
-            1000.0 * 40.0 * 40.0 / 7.0, 7.0, 0.3, 40.0, 1, 9.81, 3.0, 64.0, 0, 0, 0.2,
-            &grid.rho_prev, 0.0,
+            &grid.state_a, &grid.acc_a, &grid.rho_prev, dt, sph_grid,
         );
         let da = client.read_one_unchecked(dense.acc_a.clone());
         let d = f32::from_bytes(&da);

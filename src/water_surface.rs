@@ -109,8 +109,9 @@ pub fn setup_water_surface(
         // CRITICAL: the plane spans the whole domain at y=0 and must NOT cast shadows —
         // as a default shadow-caster it occluded the sun and put the ENTIRE terrain
         // below y=0 in shadow ("darkened basins with a uniform, y=0 height everywhere",
-        // static, from the start). This was the mystery all along: with an empty
-        // surface texture the plane is invisible yet still shadow-casting.
+        // static, from the start). Note: an empty surface texture makes the plane
+        // invisible in those regions, yet the mesh still shadow-casts — the fix is
+        // only here, not in the shader.
         NotShadowCaster,
     ));
     commands.insert_resource(WaterSurfaceAssets { material });

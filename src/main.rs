@@ -164,7 +164,7 @@ fn setup(
         // quite bright, so raising the exposure compensation helps
         // bring the scene to a nicer brightness range.
         camera::Exposure { ev100: 13.0 },
-        bevy::core_pipeline::tonemapping::Tonemapping::None,
+        bevy::core_pipeline::tonemapping::Tonemapping::Linear,
         // Bloom gives the sun a much more natural look.
         Bloom::NATURAL,
         // Enables the atmosphere to drive reflections and ambient lighting (IBL) for this view
