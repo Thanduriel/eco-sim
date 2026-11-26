@@ -148,7 +148,13 @@ impl SphParams {
 /// Persistent GPU water state (double-buffered for ping-pong between steps).
 #[derive(Resource)]
 pub struct WaterParticles {
+    /// Live particle count (the initial blob, grown by the stream brush).
     pub num: usize,
+    /// Allocated per-particle capacity (>= `num`). The per-particle buffers and the grid
+    /// list are sized at this at startup so particles can be APPENDED at runtime
+    /// (`append_particles`) without reallocating any GPU buffer. Kernels always receive
+    /// `num`, so trailing slots are never read.
+    pub capacity: usize,
     /// 4 floats per particle: [x, y, z, unused].
     pub pos_a: Handle,
     pub pos_b: Handle,
@@ -1657,6 +1663,9 @@ pub fn setup_water(
         (sz / s).ceil() as usize,
     );
     let num = nx * ny * nz;
+    // The stream brush appends particles at runtime, so every per-particle buffer (and
+    // the grid list) is allocated at the full budget, not the initial blob size.
+    let capacity = params.max_particles.max(num);
     let cx = crate::domain::CENTER.x;
     let cz = crate::domain::CENTER.y;
     // Float the blob above the LOCAL terrain: a fixed base_y can be below the ridge
@@ -1694,17 +1703,18 @@ pub fn setup_water(
 
     let bytes = |data: &Vec<f32>| cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(data).to_vec());
 
-    let pos_a = client.empty((num * 4) * core::mem::size_of::<f32>());
-    let pos_b = client.empty((num * 4) * core::mem::size_of::<f32>());
-    let vel_a = client.empty((num * 4) * core::mem::size_of::<f32>());
-    let vel_b = client.empty((num * 4) * core::mem::size_of::<f32>());
-    let state_a = client.empty((num * 4) * core::mem::size_of::<f32>());
-    let state_b = client.empty((num * 4) * core::mem::size_of::<f32>());
-    let rho_prev = client.empty((num * 4) * core::mem::size_of::<f32>());
-    let acc_a = client.empty((num * 4) * core::mem::size_of::<f32>());
-    let acc_b = client.empty((num * 4) * core::mem::size_of::<f32>());
-    let xsph_delta = client.empty((num * 4) * core::mem::size_of::<f32>());
-    let press_cache = client.empty((num * 4) * core::mem::size_of::<f32>());
+    let per_particle = capacity * 4 * core::mem::size_of::<f32>();
+    let pos_a = client.empty(per_particle);
+    let pos_b = client.empty(per_particle);
+    let vel_a = client.empty(per_particle);
+    let vel_b = client.empty(per_particle);
+    let state_a = client.empty(per_particle);
+    let state_b = client.empty(per_particle);
+    let rho_prev = client.empty(per_particle);
+    let acc_a = client.empty(per_particle);
+    let acc_b = client.empty(per_particle);
+    let xsph_delta = client.empty(per_particle);
+    let press_cache = client.empty(per_particle);
     client.write(&pos_a, bytes(&pos));
     client.write(&vel_a, bytes(&vel));
     client.write(
@@ -1725,7 +1735,7 @@ pub fn setup_water(
     let cells = cells_x * cells_y * cells_z;
     let grid_counts = client.empty(cells * core::mem::size_of::<u32>());
     let grid_scan = client.empty((cells + 1) * core::mem::size_of::<u32>());
-    let grid_list = client.empty(num * core::mem::size_of::<u32>());
+    let grid_list = client.empty(capacity * core::mem::size_of::<u32>());
     let treads = 64usize;
     let nblocks = cells.div_ceil(treads);
     let grid_totals = client.empty(nblocks * core::mem::size_of::<u32>());
@@ -1740,6 +1750,7 @@ pub fn setup_water(
 
     commands.insert_resource(WaterParticles {
         num,
+        capacity,
         pos_a,
         pos_b,
         vel_a,
@@ -1770,6 +1781,71 @@ pub fn setup_water(
         cells: splat_cells,
         current_is_b: false,
     });
+}
+
+/// Host write into an exact byte sub-range of `handle`, in place. The view is clamped to
+/// the written region (`offset_start` + `offset_end`), so the wgpu server takes its
+/// non-padding path (`queue.write_buffer`, no staging): a sub-range view with an open
+/// end would zero-pad the staging copy over the REST of the binding — i.e. it would wipe
+/// the live particles right after the spawn point.
+fn write_at(client: &Client, handle: &Handle, byte_offset: usize, data: cubecl::bytes::Bytes) {
+    let len = data.len() as u64;
+    let view = handle
+        .clone()
+        .offset_start(byte_offset as u64)
+        .offset_end(handle.size() - byte_offset as u64 - len);
+    client.write(&view, data);
+}
+
+/// Appends `positions` as new SPH particles at the end of the live set, initializing every
+/// per-particle buffer in place — including BOTH ping-pong halves, because the next fixed
+/// step may read either. `rho0` seeds the dense-state scratch exactly like `setup_water`.
+///
+/// The spawn system runs in `Update`, i.e. after the frame's `run_water`; the writes are
+/// queued on the same cubecl stream, so they land after the tick that just ran and before
+/// the next one. Returns how many particles were actually appended (clamped by capacity).
+pub fn append_particles(
+    client: &Client,
+    p: &mut WaterParticles,
+    positions: &[Vec3],
+    rho0: f32,
+) -> usize {
+    let n = positions.len().min(p.capacity.saturating_sub(p.num));
+    if n == 0 {
+        return 0;
+    }
+    let start = p.num;
+    let byte_offset = start * 4 * core::mem::size_of::<f32>();
+
+    let mut pos = Vec::with_capacity(n * 4);
+    let mut state = Vec::with_capacity(n * 4);
+    for v in &positions[..n] {
+        pos.extend_from_slice(&[v.x, v.y, v.z, 0.0]);
+        // Rest density: the first `compute_density` pass rewrites `state` entirely, but
+        // `rho_prev` is read as the delta-SPH denominator before its first overwrite.
+        state.extend_from_slice(&[rho0, 0.0, 0.0, 0.0]);
+    }
+    let zero = vec![0.0f32; n * 4];
+    let bytes_of = |data: &[f32]| cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(data).to_vec());
+
+    let pos_bytes = bytes_of(&pos);
+    let state_bytes = bytes_of(&state);
+    let zero_vel = bytes_of(&zero);
+    let zero_acc = bytes_of(&zero);
+    write_at(client, &p.pos_a, byte_offset, pos_bytes.clone());
+    write_at(client, &p.pos_b, byte_offset, pos_bytes);
+    write_at(client, &p.vel_a, byte_offset, zero_vel.clone());
+    write_at(client, &p.vel_b, byte_offset, zero_vel);
+    write_at(client, &p.state_a, byte_offset, state_bytes.clone());
+    write_at(client, &p.state_b, byte_offset, state_bytes.clone());
+    write_at(client, &p.rho_prev, byte_offset, state_bytes);
+    write_at(client, &p.acc_a, byte_offset, zero_acc.clone());
+    write_at(client, &p.acc_b, byte_offset, zero_acc.clone());
+    write_at(client, &p.xsph_delta, byte_offset, zero_acc.clone());
+    write_at(client, &p.press_cache, byte_offset, zero_acc);
+
+    p.num += n;
+    n
 }
 
 /// Phase 2 main loop: `substeps` fixed velocity-Verlet steps per physics tick, then refresh

@@ -68,6 +68,7 @@ fn main() {
         .insert_resource(gpu::FieldVisGpuData::default())
         .insert_resource(parameters::GeneralParameters::default())
         .insert_resource(terrain::TerrainAssets::default())
+        .insert_resource(player_inputs::PickingMode::default())
         .add_systems(EguiPrimaryContextPass, parameters::parameter_ui_system)
         .add_systems(Startup, setup)
         .add_systems(Startup, (gpu::setup_gpu_context, terrain::setup_terrain).chain())
@@ -75,6 +76,12 @@ fn main() {
         .add_systems(
             Update,
             player_inputs::picking_system.run_if(
+                not(egui_wants_any_keyboard_input).and_then(not(egui_wants_any_pointer_input)),
+            ),
+        )
+        .add_systems(
+            Update,
+            player_inputs::water_stream_system.run_if(
                 not(egui_wants_any_keyboard_input).and_then(not(egui_wants_any_pointer_input)),
             ),
         )

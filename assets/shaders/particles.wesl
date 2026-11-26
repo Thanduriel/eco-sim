@@ -1,10 +1,12 @@
 //! Phase 4: SPH particle point sprites (billboards reading the live sim position buffer).
 //!
-//! The mesh is `num * 4` vertices (one quad per particle); `vertex_index` decodes quad
-//! and corner. The vertex shader reads the particle's position from the storage buffer
-//! (mirrored GPU-side by `gpu::copy_particles_to_shader_buffer` — no CPU round-trips),
-//! billboards the quad using the camera's right/up axes (`view.world_from_view`), and the
-//! fragment shader draws a soft round sprite with a bright core.
+//! The mesh is `capacity * 4` vertices (one quad per allocated particle slot);
+//! `vertex_index` decodes quad and corner. Quads past the live count (the stream brush
+//! appends particles up to the capacity at runtime) are discarded via the `count` flag.
+//! The vertex shader reads the particle's position from the storage buffer (mirrored
+//! GPU-side by `gpu::copy_particles_to_shader_buffer` — no CPU round-trips), billboards
+//! the quad using the camera's right/up axes (`view.world_from_view`), and the fragment
+//! shader draws a soft round sprite with a bright core.
 
 import bevy_render::view::View;
 
@@ -12,8 +14,8 @@ import bevy_render::view::View;
 struct ParticleUniform {
     size: f32,
     alpha: f32,
-    _pad0: f32,
-    _pad1: f32,
+    count: f32,
+    _pad: f32,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0)
@@ -41,6 +43,15 @@ struct VertexOutput {
 fn vertex(in: VertexInput) -> VertexOutput {
     let quad = in.vertex_index / 4u;
     let corner = in.vertex_index % 4u;
+    var out: VertexOutput;
+    if (f32(quad)) >= particle_uniform.count {
+        // The mesh is built at the full particle capacity (the stream brush grows the
+        // live count without re-uploading): push quads past the live count outside the
+        // clip volume instead of drawing them at a stale position.
+        out.position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        out.uv = in.uv;
+        return out;
+    }
     var offs = array<vec2<f32>, 4>(
         vec2<f32>(-0.5, -0.5),
         vec2<f32>(0.5, -0.5),
@@ -54,7 +65,6 @@ fn vertex(in: VertexInput) -> VertexOutput {
         + view.world_from_view[0].xyz * off.x
         + view.world_from_view[1].xyz * off.y;
 
-    var out: VertexOutput;
     out.position = view.clip_from_world * vec4<f32>(world_pos, 1.0);
     out.uv = in.uv;
     return out;

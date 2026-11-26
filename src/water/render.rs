@@ -171,8 +171,10 @@ pub struct ParticleUniform {
     pub size: f32,
     /// Alpha of the sprites (0 = hidden).
     pub alpha: f32,
-    _pad0: f32,
-    _pad1: f32,
+    /// Live particle count: the mesh is built at full capacity (the stream brush appends
+    /// particles at runtime), and quads past this count are pushed outside the clip volume.
+    pub count: f32,
+    _pad: f32,
 }
 
 #[derive(Asset, AsBindGroup, TypePath, Clone, Debug)]
@@ -204,8 +206,11 @@ pub struct ParticleAssets {
     pub material: Handle<ParticleMaterial>,
 }
 
-/// Spawns the particle sprite layer. Mirrors `water::setup_water`'s particle-count math
-/// (blob extents / spacing) so the storage buffer always matches the sim.
+/// Spawns the particle sprite layer. Mirrors `water::setup_water`'s capacity math
+/// (max of `max_particles` and the initial blob count) so the storage buffer and the
+/// quad mesh always match the sim's allocation: the stream brush grows `num` up to the
+/// capacity without re-uploading anything, and the shader discards quads past the live
+/// count (`ParticleUniform::count`).
 pub fn setup_particles(
     mut commands: Commands,
     params: Res<parameters::GeneralParameters>,
@@ -221,10 +226,11 @@ pub fn setup_particles(
         (wp.blob_size[1] / s).ceil() as usize,
         (wp.blob_size[2] / s).ceil() as usize,
     );
-    let num = nx * ny * nz;
-    if num == 0 {
+    let blob_num = nx * ny * nz;
+    if blob_num == 0 {
         return;
     }
+    let capacity = wp.max_particles.max(blob_num);
 
     // Quad list: 4 vertices per particle. The shader decodes quad = vertex_index / 4,
     // corner = vertex_index % 4, and displaces the corner onto the particle position.
@@ -235,18 +241,18 @@ pub fn setup_particles(
         [-0.5, 0.5, 0.0],
     ];
     let corner_uvs: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-    let mut positions = Vec::with_capacity(num * 4);
-    let mut normals = Vec::with_capacity(num * 4);
-    let mut uvs = Vec::with_capacity(num * 4);
-    for _ in 0..num {
+    let mut positions = Vec::with_capacity(capacity * 4);
+    let mut normals = Vec::with_capacity(capacity * 4);
+    let mut uvs = Vec::with_capacity(capacity * 4);
+    for _ in 0..capacity {
         for c in 0..4 {
             positions.push(corners[c]);
             normals.push([0.0, 1.0, 0.0]);
             uvs.push(corner_uvs[c]);
         }
     }
-    let mut indices = Vec::with_capacity(num * 6);
-    for q in 0..num {
+    let mut indices = Vec::with_capacity(capacity * 6);
+    for q in 0..capacity {
         let b = (q * 4) as u32;
         indices.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
     }
@@ -261,7 +267,7 @@ pub fn setup_particles(
     // shader skips particles inside the terrain only by depth-testing (they're at y=0
     // initially, hidden under the terrain dome).
     let storage = shader_buffers.add(ShaderBuffer::new(
-        vec![[0.0f32; 4]; num],
+        vec![[0.0f32; 4]; capacity],
         RenderAssetUsages::default(),
     ));
 
@@ -269,6 +275,7 @@ pub fn setup_particles(
         uniform: ParticleUniform {
             size: wp.particle_size,
             alpha: if wp.particle_vis { wp.particle_alpha } else { 0.0 },
+            count: blob_num as f32,
             ..default()
         },
         particles: storage.clone(),
@@ -287,14 +294,16 @@ pub fn setup_particles(
     commands.insert_resource(ParticleAssets { material });
 
     field_vis_gpu.particles.storage = storage;
-    field_vis_gpu.particles.count = num as u32;
+    field_vis_gpu.particles.count = blob_num as u32;
 }
 
-/// Refreshes the material uniform when the F4 tunables change (size / alpha / visibility).
+/// Refreshes the material uniform when the F4 tunables change (size / alpha / visibility)
+/// or the stream brush grows the live particle count.
 pub fn update_particle_uniform(
     params: Res<parameters::GeneralParameters>,
     assets: Res<ParticleAssets>,
     mut materials: ResMut<Assets<ParticleMaterial>>,
+    particles: Option<Res<super::physics::WaterParticles>>,
 ) {
     let Some(mut material) = materials.get_mut(&assets.material) else {
         return;
@@ -302,9 +311,14 @@ pub fn update_particle_uniform(
     let wp = &params.water;
     let want_size = if wp.particle_vis { wp.particle_size } else { 0.0 };
     let want_alpha = if wp.particle_vis { wp.particle_alpha } else { 0.0 };
-    if material.uniform.size == want_size && material.uniform.alpha == want_alpha {
+    let want_count = particles.as_ref().map_or(0.0, |p| p.num as f32);
+    if material.uniform.size == want_size
+        && material.uniform.alpha == want_alpha
+        && material.uniform.count == want_count
+    {
         return;
     }
     material.uniform.size = want_size;
     material.uniform.alpha = want_alpha;
+    material.uniform.count = want_count;
 }

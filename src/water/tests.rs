@@ -192,6 +192,7 @@
             };
             let p = WaterParticles {
                 num: self.num,
+                capacity: self.num,
                 pos_a: self.pos_a.clone(),
                 pos_b: self.pos_b.clone(),
                 vel_a: self.vel_a.clone(),
@@ -1038,6 +1039,7 @@
         let list = alloc_u(num);
         let p = WaterParticles {
             num,
+            capacity: num,
             pos_a: pos_h.clone(),
             pos_b: pos_h.clone(),
             vel_a: pos_h.clone(),
@@ -1118,6 +1120,164 @@
         assert_eq!(total, num as u32);
     }
 
+    /// The stream brush (`append_particles`) on the GPU: appending particles into
+    /// pre-allocated (capacity-sized) buffers must land the data in both ping-pong
+    /// halves, grow `num`, and keep the count/prefix/scatter invariants of the next grid
+    /// build (same checks as `grid_cell_lists_are_consistent_on_gpu`). This pins the
+    /// sub-range host-write path (`Handle::offset_start`/`offset_end` views) — an
+    /// unbounded view would zero-pad the write over the tail of the buffer and corrupt
+    /// the live particles.
+    #[test]
+    fn stream_spawn_is_grid_consistent_on_gpu() {
+        let Some(client) = test_gpu_client() else {
+            eprintln!("no GPU adapter; grid test requires integer atomics - skipped");
+            return;
+        };
+        let spacing = 0.5f32;
+        let h = spacing * 1.3;
+        let cell_size = 2.0 * h;
+        let cell_inv = 1.0 / cell_size;
+        let cells = (50, 7, 50);
+        let n_cells = cells.0 * cells.1 * cells.2;
+        let nblocks = n_cells.div_ceil(64usize);
+        let (nx, ny, nz) = (24usize, 4, 24);
+        let num = nx * ny * nz;
+        let (cx, cz) = (26.0f32, 26.0f32);
+        let extra = 32usize;
+        let capacity = num + extra;
+        let mut pos = Vec::with_capacity(num * 4);
+        for y in 0..ny {
+            for z in 0..nz {
+                for x in 0..nx {
+                    pos.push(cx + x as f32 * spacing);
+                    pos.push(1.5 + y as f32 * spacing);
+                    pos.push(cz + z as f32 * spacing);
+                    pos.push(0.0);
+                }
+            }
+        }
+        let alloc = |n: usize| client.empty(n * core::mem::size_of::<f32>());
+        let alloc_u = |n: usize| client.empty(n * core::mem::size_of::<u32>());
+        let pos_h = alloc(capacity * 4);
+        client.write(&pos_h, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&pos).to_vec()));
+        let p = WaterParticles {
+            num,
+            capacity,
+            pos_a: pos_h.clone(),
+            pos_b: alloc(capacity * 4),
+            vel_a: alloc(capacity * 4),
+            vel_b: alloc(capacity * 4),
+            state_a: alloc(capacity * 4),
+            state_b: alloc(capacity * 4),
+            rho_prev: alloc(capacity * 4),
+            acc_a: alloc(capacity * 4),
+            acc_b: alloc(capacity * 4),
+            xsph_delta: alloc(capacity * 4),
+            press_cache: alloc(capacity * 4),
+            terrain: alloc(1),
+            terrain_x: 1,
+            terrain_y: 1,
+            grid_counts: alloc_u(n_cells),
+            grid_scan: alloc_u(n_cells + 1),
+            grid_list: alloc_u(capacity),
+            grid_totals: alloc_u(nblocks),
+            grid_offsets: alloc_u(nblocks + 1),
+            cells_x: cells.0,
+            cells_y: cells.1,
+            cells_z: cells.2,
+            cell_inv,
+            splat_counts: alloc_u(1),
+            splat: alloc(1),
+            surface_max: alloc_u(1),
+            surface: alloc(1),
+            cells: 1,
+            current_is_b: false,
+        };
+        // A loose cloud above the box (like the brush: terrain point + height offset).
+        let spawned: Vec<glam::Vec3> = (0..extra)
+            .map(|k| {
+                glam::Vec3::new(
+                    cx - 0.5 + (k % 4) as f32 * spacing,
+                    (1.5 + ny as f32 * spacing) + 0.5 + (k % 2) as f32 * spacing,
+                    cz - 0.5 + (k / 4) as f32 * spacing,
+                )
+            })
+            .collect();
+
+        let mut p = p;
+        let appended = append_particles(&client, &mut p, &spawned, 1000.0);
+        assert_eq!(appended, extra, "appended count");
+        assert_eq!(p.num, num + extra, "live count after append");
+
+        // The appended positions must be readable back from BOTH ping-pong halves (the
+        // next fixed step may read either), bit-exact.
+        for h in [p.pos_a.clone(), p.pos_b.clone()] {
+            let pb = client.read_one_unchecked(h);
+            let px = f32::from_bytes(&pb);
+            for (k, v) in spawned.iter().enumerate() {
+                let p4 = (num + k) * 4;
+                assert_eq!(px[p4], v.x, "pos_a/b appended x[{k}]");
+                assert_eq!(px[p4 + 1], v.y, "pos_a/b appended y[{k}]");
+                assert_eq!(px[p4 + 2], v.z, "pos_a/b appended z[{k}]");
+            }
+        }
+
+        build_grid(&client, &p, &p.pos_a);
+
+        let cb = client.read_one_unchecked(p.grid_counts.clone());
+        let c = u32::from_bytes(&cb);
+        let sb = client.read_one_unchecked(p.grid_scan.clone());
+        let s = u32::from_bytes(&sb);
+        let lb = client.read_one_unchecked(p.grid_list.clone());
+        let l = u32::from_bytes(&lb);
+
+        // Same invariants as the base test, over the extended position set (initial blob
+        // first, appended particles right after — the same order `append_particles` wrote).
+        assert_eq!(s[n_cells], p.num as u32, "prefix total");
+        let cell_of = |k: usize| -> usize {
+            let p4 = k * 4;
+            let ix = if k < num {
+                (pos[p4] * cell_inv) as usize
+            } else {
+                let v = &spawned[k - num];
+                (v.x * cell_inv) as usize
+            };
+            let iy = if k < num {
+                (pos[p4 + 1] * cell_inv) as usize
+            } else {
+                (spawned[k - num].y * cell_inv) as usize
+            };
+            let iz = if k < num {
+                (pos[p4 + 2] * cell_inv) as usize
+            } else {
+                (spawned[k - num].z * cell_inv) as usize
+            };
+            ix.min(cells.0 - 1) + cells.0 * (iy.min(cells.1 - 1) + cells.1 * iz.min(cells.2 - 1))
+        };
+        let mut seen = vec![false; p.num];
+        for k in 0..p.num {
+            let j = l[k] as usize;
+            assert!(j < p.num, "list[k]={j} out of range");
+            assert!(!seen[j], "duplicate particle index {j} in list");
+            seen[j] = true;
+            let cell = cell_of(j);
+            let lo = s[cell] as usize;
+            let hi = s[cell + 1] as usize;
+            assert!(
+                k >= lo && k < hi,
+                "particle {j} (cell {cell}, range {lo}..{hi}) listed at k={k}"
+            );
+        }
+        assert!(seen.iter().all(|&v| v), "list misses particles");
+        let mut total: u32 = 0;
+        for cell in 0..n_cells {
+            let delta = s[cell + 1] - s[cell];
+            assert_eq!(c[cell], delta, "cell {cell} count after scatter");
+            total += c[cell];
+        }
+        assert_eq!(total, p.num as u32);
+    }
+
     /// Grid physics at production-ish scale (6144 particles, use_grid=1): a number of
     /// substeps must run and the accelerations must stay finite and plausible. This is
     /// the coverage the Rig tests lack (they run the dense all-pairs path).
@@ -1166,6 +1326,7 @@
         client.write(&tn, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&tdata).to_vec()));
         let p = WaterParticles {
             num,
+            capacity: num,
             pos_a: pos_h.clone(),
             pos_b: alloc(pos.len()),
             vel_a: vel_h.clone(),
@@ -1281,6 +1442,7 @@
         let sh = alloc_u(cells + 1);
         let p = WaterParticles {
             num: cells,
+            capacity: cells,
             pos_a: ch.clone(), pos_b: ch.clone(),
             vel_a: ch.clone(), vel_b: ch.clone(),
             state_a: ch.clone(), state_b: ch.clone(),
@@ -1406,6 +1568,7 @@
             client.write(&tn, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&tdata).to_vec()));
             WaterParticles {
                 num,
+                capacity: num,
                 pos_a: pos_h.clone(),
                 pos_b: alloc(pos.len()),
                 vel_a: vel_h.clone(),
@@ -1618,6 +1781,7 @@
 
             let p = WaterParticles {
                 num,
+                capacity: num,
                 pos_a: pos_h.clone(),
                 pos_b: buf_f(num * 4),
                 vel_a: vel_h.clone(),

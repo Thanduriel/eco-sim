@@ -108,6 +108,19 @@ pub struct WaterParameters {
     pub smoothing_ratio: f32,
     /// Grid extent in y used for the neighbor cells (particles above this are invalid).
     pub max_particle_height: f32,
+    /// Total SPH particle budget: the initial blob plus every particle added with the
+    /// stream brush (picking mode `3`, hold right mouse). All per-particle GPU buffers
+    /// are allocated at this capacity at startup; the stream is clamped at it.
+    pub max_particles: usize,
+    /// Stream brush: particles emitted per second while the right mouse button is held
+    /// (the fractional remainder carries between frames).
+    pub spawn_flow: f32,
+    /// Stream brush: height (m) above the terrain raycast point at which new particles
+    /// are born (constant offset, independent of the surface slope).
+    pub spawn_height_offset: f32,
+    /// Stream brush: horizontal jitter radius (m) around the raycast point (random; keeps
+    /// the pour from stacking streams of particles on exactly one lattice point).
+    pub spawn_radius: f32,
     /// Phase 3 rendering: water depth (m) at which the surface color saturates to "deep".
     pub surface_depth_scale: f32,
     /// Phase 3 rendering: water depth (m) at which the surface alpha saturates (shoreline
@@ -139,6 +152,10 @@ impl Default for WaterParameters {
             stiffness_clamp: 0.1,
             smoothing_ratio: 1.3,
             max_particle_height: 8.0,
+            max_particles: 32768,
+            spawn_flow: 32.0,
+            spawn_height_offset: 1.5,
+            spawn_radius: 0.2,
             surface_depth_scale: 4.0,
             surface_alpha_scale: 1.0,
             particle_vis: true,
