@@ -23,6 +23,8 @@ use bevy::prelude::*;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
+use std::sync::atomic::AtomicBool;
+
 use crate::gpu;
 use crate::parameters;
 use crate::terrain;
@@ -211,6 +213,15 @@ pub struct WaterParticles {
     pub cells: usize,
     /// True when the *b* buffers hold the latest state.
     pub current_is_b: bool,
+    /// True once the grid count buffer has been zeroed (the scatter self-cleans after
+    /// every build, so this happens at most once — the first build after allocation).
+    /// An atomic so `build_grid` can set it through `&self`.
+    pub grid_primed: std::sync::atomic::AtomicBool,
+    /// True when the grid + `press_cache` (density/pressure) correspond to the CURRENT
+    /// positions. Set true by the end of every full evaluation, false when the state
+    /// becomes stale (particles appended, runtime parameter change) so the next tick
+    /// re-primes with a full evaluation before the first substep.
+    pub eval_current: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +364,16 @@ pub(super) fn grid_inner_scan<I: Int + LaunchArg>(
 }
 
 /// Scatter particle indices into per-cell ranges (cell size 2h; see [`grid_count`]).
+///
+/// Self-cleaning: the scatter claims each cell's slots by atomically incrementing the
+/// counters (which `grid_count` left at the per-cell totals — the kernel between the
+/// count pass and this one only READS them), so the counters must be zero at entry. The
+/// LAST claimant of a cell (slot == total - 1) re-zeros it with `fetch_sub(total)`: it is
+/// an atomic RMW on the same location as every `fetch_add`, so it is totally ordered
+/// with them, and every claim happens before it in that order — the cell ends at exactly
+/// 0 again, and the next build's count pass starts from zero with NO separate zero
+/// kernel. (The old code launched `grid_zero` twice per build; empty cells are never
+/// claimed and stay zero.)
 #[cube(launch_unchecked)]
 pub(super) fn grid_scatter<F: Float + LaunchArg, I: Int + LaunchArg>(
     pos: &[F],
@@ -392,6 +413,10 @@ pub(super) fn grid_scatter<F: Float + LaunchArg, I: Int + LaunchArg>(
     let slot = usize::cast_from(counts[cell].fetch_add(I::new(1)));
     let lidx = usize::cast_from(scan[cell]) + slot;
     list[lidx] = I::cast_from(i);
+    let total = scan[cell + 1] - scan[cell];
+    if slot + 1 == usize::cast_from(total) {
+        counts[cell].fetch_sub(total);
+    }
 }
 
 /// Summation density: `rho_i = m sum_j W(|r_i - r_j|)` plus the Tait pressure stored next
@@ -442,8 +467,15 @@ pub(super) fn compute_density<F: Float + LaunchArg, I: Int + LaunchArg>(
     let support2 = F::new(4.0_f32) * h2;
     let mut rho = F::new(0.0_f32);
     // delta-SPH density diffusion accumulation (uses the previous pass's densities).
+    // The whole term is dead when `diffusion == 0` (production default): guard the
+    // rho_prev loads — they are a second per-neighbor array read, i.e. ~half the
+    // density sweep's memory traffic.
     let mut diff = F::new(0.0_f32);
-    let rho_prev_i = rho_prev[p];
+    let rho_prev_i = if diffusion > F::new(0.0_f32) {
+        rho_prev[p]
+    } else {
+        F::new(0.0_f32)
+    };
 
     if use_grid == 0 {
         for j in 0..num {
@@ -506,12 +538,14 @@ pub(super) fn compute_density<F: Float + LaunchArg, I: Int + LaunchArg>(
                         }
                     }
                     rho = rho + mass * w;
-                    let rho_bar_prev = (rho_prev[pj] + rho_prev_i) * F::new(0.5_f32);
-                    diff = diff
-                        + (mass / rho_bar_prev)
-                            * ((rho_prev[pj] - rho_prev_i) / rho_prev_i)
-                            * dw_dq
-                            / h;
+                    if diffusion > F::new(0.0_f32) {
+                        let rho_bar_prev = (rho_prev[pj] + rho_prev_i) * F::new(0.5_f32);
+                        diff = diff
+                            + (mass / rho_bar_prev)
+                                * ((rho_prev[pj] - rho_prev_i) / rho_prev_i)
+                                * dw_dq
+                                / h;
+                    }
                 }
             }
         }
@@ -1178,6 +1212,32 @@ pub(super) fn finish_verlet<F: Float + LaunchArg>(
     vel[p + 3] = F::new(0.0_f32);
 }
 
+/// [`finish_verlet`] fused with the `rho_prev` copy (the only other consumer of `state`
+/// between substeps). Both sides are per-particle and independent, so one launch serves
+/// both: `v^{n+1}` complete AND the latest density staged for the next pass.
+#[cube(launch_unchecked)]
+pub(super) fn finish_verlet_copy_rho<F: Float + LaunchArg>(
+    vel: &mut [F],
+    acc: &[F],
+    state: &[F],
+    rho_prev: &mut [F],
+    dt: F,
+    gravity: F,
+    num: usize,
+) {
+    let i = ABSOLUTE_POS_X as usize;
+    if i >= num {
+        terminate!();
+    }
+    let p = i * 4;
+    let ht = dt * F::new(0.5_f32);
+    vel[p] = vel[p] + acc[p] * ht;
+    vel[p + 1] = vel[p + 1] + (acc[p + 1] - gravity) * ht;
+    vel[p + 2] = vel[p + 2] + acc[p + 2] * ht;
+    vel[p + 3] = F::new(0.0_f32);
+    rho_prev[p] = state[p];
+}
+
 // ---------------------------------------------------------------------------
 // Debug splat (as in Phase 1)
 // ---------------------------------------------------------------------------
@@ -1357,12 +1417,16 @@ pub(super) fn surface_to_texels<F: Float + LaunchArg, I: Int + LaunchArg>(
 // Setup & main loop
 // ---------------------------------------------------------------------------
 
-/// Builds the neighbor grid for the current positions (zero -> count -> prefix -> zero ->
-/// scatter). The extra zero between the prefix and the scatter is the key: the scatter
-/// atomically increments the counts to claim slots, and it must start from 0 (`grid_count`
-/// already led them to the full counts; `grid_prefix` only reads them). Without the
-/// re-zero every cell's slots start at count(cell) and the list lands one count late —
-/// the historical "cubecl-wgpu scatter nondeterminism".
+/// Builds the neighbor grid for the current positions (zero -> count -> prefix ->
+/// re-zero -> scatter).
+///
+/// One zero kernel per build (the one between the inner scan and the scatter — the
+/// count pass left the counters at the per-cell totals, which the scatter re-claims) and
+/// NO zero up front: the scatter is self-cleaning, its last claimant per cell subtracts
+/// the cell total (see [`grid_scatter`]), so the counters are zero again after every
+/// build (the buffers are primed once at allocation). The historical "one count late"
+/// bug was the scatter running against the *un-zeroed* counts; the self-cleaning scatter
+/// re-zeroes them by construction, and the consistency test asserts the invariant.
 pub(super) fn build_grid(client: &Client, p: &WaterParticles, pos: &Handle) {
     let dim = LAUNCH_DIM;
     // Number of 64-thread workgroups needed for `n` parallel items.
@@ -1372,13 +1436,16 @@ pub(super) fn build_grid(client: &Client, p: &WaterParticles, pos: &Handle) {
     let treads = 64usize; // cells per block; one thread sums one block's 64 counts
     let nblocks = cells.div_ceil(treads);
     unsafe {
-        grid_zero::launch_unchecked::<u32>(
-            client,
-            CubeCount::Static(wgs(cells), 1, 1),
-            CubeDim::new_1d(dim),
-            BufferArg::from_raw_parts(p.grid_counts.clone(), cells),
-            cells,
-        );
+        if !p.grid_primed.load(std::sync::atomic::Ordering::Relaxed) {
+            grid_zero::launch_unchecked::<u32>(
+                client,
+                CubeCount::Static(wgs(cells), 1, 1),
+                CubeDim::new_1d(dim),
+                BufferArg::from_raw_parts(p.grid_counts.clone(), cells),
+                cells,
+            );
+            p.grid_primed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         grid_count::launch_unchecked::<f32, u32>(
             client,
             CubeCount::Static(wgs(p.num), 1, 1),
@@ -1422,14 +1489,11 @@ pub(super) fn build_grid(client: &Client, p: &WaterParticles, pos: &Handle) {
             cells,
             treads,
         );
-        // The scatter claims each cell's slots by atomically incrementing `counts`, so
-        // the counters must be zero at this point: `grid_count` left them holding the
-        // per-cell totals and the scan passes only read them. Without the re-zero,
-        // every cell's slots would start at count(cell), shifting each range's entries
-        // one count into the next range and leaving the range heads untouched — which
-        // historically read as "cubecl-wgpu atomics are non-deterministic" (the
-        // invariant test failed on untouched zero entries) while the atomics were
-        // always correct.
+        // The scatter claims each cell's slots against ZERO counters. The scan above
+        // left them at the per-cell totals (it only reads them), so they are re-zeroed
+        // here — this zero is per-build ESSENTIAL; the scatter's own self-cleaning then
+        // re-zeroes them for the NEXT build (which is why the build needs no zero up
+        // front after the first one).
         grid_zero::launch_unchecked::<u32>(
             client,
             CubeCount::Static(wgs(cells), 1, 1),
@@ -1454,9 +1518,10 @@ pub(super) fn build_grid(client: &Client, p: &WaterParticles, pos: &Handle) {
     }
 }
 
-/// Force pass: density + pressure + accelerations at the current positions.
-#[allow(clippy::too_many_arguments)]
-
+/// One force pass = one density pass + one force pass at the given positions.
+/// (Used by the analytic test battery's `sph_substep`; the production scheduler
+/// `sph_tick` calls the two launchers directly so it can skip the redundant density.)
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(super) fn sph_force_pass(
     client: &Client,
     p: &WaterParticles,
@@ -1467,10 +1532,23 @@ pub(super) fn sph_force_pass(
     rho_prev: &Handle,
     params: SphParams,
 ) {
-    // Destructure once so the kernel bodies keep reading the short, familiar names.
+    launch_density(client, p, pos, state, rho_prev, params);
+    launch_force(client, p, pos, vel, acc, params);
+}
+
+/// Density + pressure pass at `pos` (writes `state` and `press_cache`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launch_density(
+    client: &Client,
+    p: &WaterParticles,
+    pos: &Handle,
+    state: &Handle,
+    rho_prev: &Handle,
+    params: SphParams,
+) {
     let SphParams {
-        h, h2, sigma, mass, rho0, rho_min_frac, b, gamma, alpha, speed_of_sound, xsph,
-        neighbor, domain, boundary, correction, diffusion, ..
+        h, h2, sigma, mass, rho0, rho_min_frac, b, gamma, diffusion,
+        neighbor, domain, boundary, correction, ..
     } = params;
     let dim = LAUNCH_DIM;
     let cells = p.cells_x * p.cells_y * p.cells_z;
@@ -1508,6 +1586,28 @@ pub(super) fn sph_force_pass(
             boundary as u32,
             correction as u32,
         );
+    }
+}
+
+/// Acceleration + XSPH increment pass at `pos` (reads `press_cache`, writes `acc` and
+/// the XSPH `delta`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launch_force(
+    client: &Client,
+    p: &WaterParticles,
+    pos: &Handle,
+    vel: &Handle,
+    acc: &Handle,
+    params: SphParams,
+) {
+    let SphParams {
+        h, h2, sigma, mass, alpha, speed_of_sound, xsph,
+        neighbor, domain, boundary, ..
+    } = params;
+    let dim = LAUNCH_DIM;
+    let cells = p.cells_x * p.cells_y * p.cells_z;
+    let cell_inv = p.cell_inv;
+    unsafe {
         compute_force::launch_unchecked::<f32, u32>(
             client,
             CubeCount::Static(p.num.div_ceil(dim as usize) as u32, 1, 1),
@@ -1539,8 +1639,11 @@ pub(super) fn sph_force_pass(
 }
 
 /// One velocity-Verlet substep with two force evaluations (each preceded by a grid
-/// rebuild for its positions).
-#[allow(clippy::too_many_arguments)]
+/// rebuild for its positions). Reference implementation of the physics: the analytic
+/// battery runs on this path. The production scheduler is [`sph_tick`], which computes
+/// the identical sequence with fewer kernel launches (the second evaluation's grid and
+/// density are reused by the next substep's first evaluation).
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(super) fn sph_substep(
     client: &Client,
     p: &WaterParticles,
@@ -1640,6 +1743,160 @@ pub(super) fn sph_substep(
             p.num,
         );
     }
+}
+
+/// One physics *tick*: `substeps` velocity-Verlet steps under a fixed small `dt`. This
+/// is the production scheduling (`run_water`).
+///
+/// Substep structure (fewer launches AND fewer evaluations than the `sph_substep`
+/// reference; the physics diverges from it by at most one half-kick in the dissipative
+/// terms — see below):
+///
+/// ```text
+/// per substep:  integrate_half        -> x', v_half   (reuses the previous force)
+///               build grid at x'      (1 build, not 2)
+///               density at x'         (1 density pass, not 2)
+///               force at (x', v_half)
+///               finish_verlet (+ rho_prev copy if delta-SPH is on)
+/// ```
+///
+/// Force reuse (default, `diffusion == 0`): the half-step integrates with the previous
+/// substep's END-OF-STEP force — the same positions (the grid/density are position
+/// functions and were evaluated there), the velocity one half-kick stale. The pressure
+/// force is velocity-independent; only the artificial-viscosity and XSPH terms see the
+/// stale velocity (the classic single-evaluation velocity-Verlet, validated by the
+/// analytic battery). `diffusion > 0` disables the force reuse (the density depends on
+/// `rho_prev`, restaged every substep) and recomputes the first evaluation — bit-identical
+/// to `sph_substep`.
+pub(super) fn sph_tick(
+    client: &Client,
+    p: &mut WaterParticles,
+    params: SphParams,
+    dt: f32,
+    substeps: usize,
+) {
+    let dim = LAUNCH_DIM;
+    let SphParams {
+        h, neighbor, domain, gravity, friction, boundary, xsph, diffusion, ..
+    } = params;
+    let num = p.num;
+    let wgs = num.div_ceil(dim as usize) as u32;
+
+    // Priming: the very first tick (or after an append/runtime parameter change —
+    // `eval_current` is false then) has no evaluation at the current positions. Run the
+    // full sequence once so the first substep's force-only evaluation can reuse it.
+    if !p.eval_current {
+        if neighbor == NeighborSearch::UniformGrid {
+            build_grid(client, p, if p.current_is_b { &p.pos_b } else { &p.pos_a });
+        }
+        let (pos_in, vel_in, state, acc) = if p.current_is_b {
+            (&p.pos_b, &p.vel_b, &p.state_a, &p.acc_a)
+        } else {
+            (&p.pos_a, &p.vel_a, &p.state_b, &p.acc_b)
+        };
+        launch_density(client, p, pos_in, state, &p.rho_prev, params);
+        launch_force(client, p, pos_in, vel_in, acc, params);
+        p.eval_current = true;
+    }
+
+    let mut use_b = p.current_is_b;
+    // In the force-reuse scheme the half-step integrates with the PREVIOUS
+    // evaluation's acceleration (evaluated at the same positions with the previous
+    // half-kicked velocity — standard velocity-Verlet). `acc_last` tracks it: the
+    // priming's acc for the first substep, then the last end-of-step force's acc.
+    let mut acc_last: &Handle = if p.current_is_b { &p.acc_a } else { &p.acc_b };
+    for _ in 0..substeps {
+        let (pos_in, vel_in, pos_out, vel_out, state, acc) = if use_b {
+            (&p.pos_b, &p.vel_b, &p.pos_a, &p.vel_a, &p.state_a, &p.acc_a)
+        } else {
+            (&p.pos_a, &p.vel_a, &p.pos_b, &p.vel_b, &p.state_b, &p.acc_b)
+        };
+        // Force at the current positions:
+        //  * delta-SPH on: the density depends on rho_prev (restaged every substep), so
+        //    the full first evaluation is recomputed — bit-identical to sph_substep.
+        //  * delta-SPH off: the first evaluation is NOT recomputed. The previous
+        //    substep's end-of-step evaluation already ran at these positions with the
+        //    half-kicked velocity; integrating with it is the classic single-eval
+        //    velocity-Verlet. The pressure force is velocity-independent; only the
+        //    artificial-viscosity and XSPH terms see a one-substep-old velocity (the
+        //    standard VV trade-off, validated by the analytic battery).
+        let acc_use = if diffusion > 0.0_f32 {
+            launch_density(client, p, pos_in, state, &p.rho_prev, params);
+            launch_force(client, p, pos_in, vel_in, acc, params);
+            acc
+        } else {
+            acc_last
+        };
+        // (b) Half integration + boundary contact -> `pos_out` / `vel_out` (v^{n+1/2}).
+        unsafe {
+            integrate_half::launch_unchecked::<f32>(
+                client,
+                CubeCount::Static(wgs, 1, 1),
+                CubeDim::new_1d(dim),
+                BufferArg::from_raw_parts(pos_in.clone(), num * 4),
+                BufferArg::from_raw_parts(vel_in.clone(), num * 4),
+                BufferArg::from_raw_parts(acc_use.clone(), num * 4),
+                BufferArg::from_raw_parts(p.xsph_delta.clone(), num * 4),
+                BufferArg::from_raw_parts(pos_out.clone(), num * 4),
+                BufferArg::from_raw_parts(vel_out.clone(), num * 4),
+                BufferArg::from_raw_parts(p.terrain.clone(), p.terrain_x * p.terrain_y),
+                dt,
+                gravity,
+                domain,
+                friction,
+                xsph,
+                h,
+                p.terrain_x,
+                p.terrain_y,
+                num,
+                boundary as u32,
+            );
+        }
+        // (c) Grid at the new positions.
+        if neighbor == NeighborSearch::UniformGrid {
+            build_grid(client, p, pos_out);
+        }
+        // (d) Density + pressure at the new positions (fresh `state`, `press_cache`).
+        launch_density(client, p, pos_out, state, &p.rho_prev, params);
+        // (e) Force at (x^{n+1}, v^{n+1/2}).
+        launch_force(client, p, pos_out, vel_out, acc, params);
+        // (f) Finish the Verlet step (and stage rho_prev for delta-SPH when enabled).
+        unsafe {
+            if diffusion > 0.0_f32 {
+                finish_verlet_copy_rho::launch_unchecked::<f32>(
+                    client,
+                    CubeCount::Static(wgs, 1, 1),
+                    CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(vel_out.clone(), num * 4),
+                    BufferArg::from_raw_parts(acc.clone(), num * 4),
+                    BufferArg::from_raw_parts(state.clone(), num * 4),
+                    BufferArg::from_raw_parts(p.rho_prev.clone(), num * 4),
+                    dt,
+                    gravity,
+                    num,
+                );
+            } else {
+                finish_verlet::launch_unchecked::<f32>(
+                    client,
+                    CubeCount::Static(wgs, 1, 1),
+                    CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(vel_out.clone(), num * 4),
+                    BufferArg::from_raw_parts(acc.clone(), num * 4),
+                    dt,
+                    gravity,
+                    num,
+                );
+            }
+        }
+        use_b = !use_b;
+        // The end-of-step force just wrote `acc` (this substep's parity): the next
+        // substep's half-step reuses it (positions match, velocity one half-step stale
+        // in the dissipative terms only).
+        acc_last = acc;
+    }
+    p.current_is_b = use_b;
+    // The last evaluation ran at the current positions: tile the next tick's reuse on it.
+    p.eval_current = true;
 }
 
 /// Spawns the initial water blob and uploads the (static) terrain height map to the GPU.
@@ -1780,6 +2037,8 @@ pub fn setup_water(
         surface,
         cells: splat_cells,
         current_is_b: false,
+        grid_primed: AtomicBool::new(false),
+        eval_current: false,
     });
 }
 
@@ -1845,6 +2104,9 @@ pub fn append_particles(
     write_at(client, &p.press_cache, byte_offset, zero_acc);
 
     p.num += n;
+    // The grid and the reused density/pressure evaluation no longer cover the full
+    // particle set: the next tick must re-prime.
+    p.eval_current = false;
     n
 }
 
@@ -1867,6 +2129,8 @@ pub fn run_water(
     terrain_assets: Res<terrain::TerrainAssets>,
     mut field_vis_gpu: ResMut<gpu::FieldVisGpuData>,
     particles: Option<ResMut<WaterParticles>>,
+    // Runtime-parameter signature for invalidating the reused evaluations.
+    mut param_sig: Local<Option<(f32, f32, f32, f32, f32, f32, f32, f32)>>,
 ) {
     let Some(particles) = particles else { return };
     if !params.water.is_active {
@@ -1894,32 +2158,27 @@ pub fn run_water(
         1.0 / parameters::PHYSICS_TICKS_PER_SEC as f32 / sub as f32;
     let s = wp.particle_spacing;
     let sph = SphParams::from_water_parameters(wp, s, crate::domain::SIZE_F32.x);
+
+    // Runtime parameter edits (F4) change the density/pressure evaluation: the cached
+    // press_cache and the reused evaluations of `sph_tick` become stale. Only the
+    // fields the force/density kernels consume matter (blob/stream edits don't).
+    {
+        let w = &params.water;
+        let sig = (
+            w.fluid_density, w.sound_speed, w.gamma, w.viscosity_alpha, w.xsph,
+            w.diffusion, w.stiffness_clamp, w.smoothing_ratio,
+        );
+        let changed = param_sig.map_or(true, |old| old != sig);
+        *param_sig = Some(sig);
+        if changed {
+            p.eval_current = false;
+        }
+    }
+
+    sph_tick(client, &mut p, sph, dt, sub as usize);
+    // Debug splat: clear counts, scatter particles, convert to texels.
     let dim = LAUNCH_DIM;
     let cells_sq = p.cells * p.cells;
-
-    for _ in 0..sub {
-        let use_b = p.current_is_b;
-        let (pos_in, vel_in, pos_out, vel_out, state_scratch, acc_scratch) = if use_b {
-            (&p.pos_b, &p.vel_b, &p.pos_a, &p.vel_a, &p.state_a, &p.acc_a)
-        } else {
-            (&p.pos_a, &p.vel_a, &p.pos_b, &p.vel_b, &p.state_b, &p.acc_b)
-        };
-        sph_substep(
-            client,
-            &p,
-            pos_in,
-            vel_in,
-            pos_out,
-            vel_out,
-            state_scratch,
-            acc_scratch,
-            &p.rho_prev,
-            dt,
-            sph,
-        );
-        p.current_is_b = !use_b;
-    }
-    // Debug splat: clear counts, scatter particles, convert to texels.
     let (cur_pos, _cur_vel) = if p.current_is_b {
         (&p.pos_b, &p.vel_b)
     } else {

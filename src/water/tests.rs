@@ -3,6 +3,7 @@
 //! headless wgpu device); the grid-specific tests are GPU-only (CPU has no atomics).
 
     use super::physics::*;
+    use std::sync::atomic::AtomicBool;
     use cubecl::prelude::*;
     use cubecl::server::Handle;
     use cubecl::wgpu::wgpu as wgpu;
@@ -229,6 +230,8 @@
                 surface: self.grid_scan.clone(),
                 cells: 1,
                 current_is_b: self.use_b,
+                grid_primed: AtomicBool::new(false),
+                eval_current: false,
             };
             for _ in 0..steps {
                 let (pos_in, vel_in, pos_out, vel_out) = if self.use_b {
@@ -1069,6 +1072,8 @@
             surface: pos_h.clone(),
             cells: 1,
             current_is_b: false,
+            grid_primed: AtomicBool::new(false),
+            eval_current: false,
         };
         build_grid(&client, &p, &pos_h);
 
@@ -1082,8 +1087,9 @@
 
         // Invariants:
         //  * scan is monotonically increasing and scan[n_cells] == num (true count).
-        //  * counts *after* the scatter equal `scan` deltas (the scatter's atomics double
-        //    the counters; the scan built before the scatter is authoritative).
+        //  * counts after the scatter are all ZERO again: the scatter is self-cleaning
+        //    (its last claimant per cell subtracts the cell total), so the next build's
+        //    count pass starts from zero without a separate zero kernel.
         //  * `list` is a permutation of 0..num, and each entry k lies in the range of its
         //    own cell (scan[cell(k)] <= k < scan[cell(k) + 1]).
         assert_eq!(s[n_cells], num as u32, "prefix total");
@@ -1109,15 +1115,10 @@
             );
         }
         assert!(seen.iter().all(|&v| v), "list misses particles");
-        // Also check count consistency: after the scatter the counters have advanced by
-        // exactly one per particle, so they equal the prefix deltas again.
-        let mut total: u32 = 0;
+        // Self-cleaning scatter invariant: every counter is back to zero after the build.
         for cell in 0..n_cells {
-            let delta = s[cell + 1] - s[cell];
-            assert_eq!(c[cell], delta, "cell {cell} count after scatter");
-            total += c[cell];
+            assert_eq!(c[cell], 0, "cell {cell} count after self-cleaning scatter");
         }
-        assert_eq!(total, num as u32);
     }
 
     /// The stream brush (`append_particles`) on the GPU: appending particles into
@@ -1192,6 +1193,8 @@
             surface: alloc(1),
             cells: 1,
             current_is_b: false,
+            grid_primed: AtomicBool::new(false),
+            eval_current: false,
         };
         // A loose cloud above the box (like the brush: terrain point + height offset).
         let spawned: Vec<glam::Vec3> = (0..extra)
@@ -1269,13 +1272,10 @@
             );
         }
         assert!(seen.iter().all(|&v| v), "list misses particles");
-        let mut total: u32 = 0;
+        // Self-cleaning scatter invariant: every counter is back to zero after the build.
         for cell in 0..n_cells {
-            let delta = s[cell + 1] - s[cell];
-            assert_eq!(c[cell], delta, "cell {cell} count after scatter");
-            total += c[cell];
+            assert_eq!(c[cell], 0, "cell {cell} count after self-cleaning scatter");
         }
-        assert_eq!(total, p.num as u32);
     }
 
     /// Grid physics at production-ish scale (6144 particles, use_grid=1): a number of
@@ -1356,6 +1356,8 @@
             surface: alloc(1),
             cells: 1,
             current_is_b: false,
+            grid_primed: AtomicBool::new(false),
+            eval_current: false,
         };
         let dt = 1.0 / 60.0 / 4.0;
         let sph = SphParams {
@@ -1461,6 +1463,7 @@
             splat_counts: ch.clone(), splat: ch.clone(),
             surface_max: ch.clone(), surface: ch.clone(),
             cells: 1, current_is_b: false,
+            grid_primed: AtomicBool::new(false), eval_current: false,
         };
         let dim = LAUNCH_DIM;
         unsafe {
@@ -1598,6 +1601,8 @@
                 surface: alloc(1),
                 cells: 1,
                 current_is_b: false,
+                grid_primed: AtomicBool::new(false),
+                eval_current: false,
             }
         };
         let dense = mk();
@@ -1779,7 +1784,7 @@
             client.write(&rho_prev_h, bytes(&vec![wp.fluid_density; num * 4]));
             client.write(&terr_h, bytes(&terrain));
 
-            let p = WaterParticles {
+            let mut p = WaterParticles {
                 num,
                 capacity: num,
                 pos_a: pos_h.clone(),
@@ -1811,9 +1816,13 @@
                 surface: surf_h.clone(),
                 cells: splat_cells,
                 current_is_b: false,
+                grid_primed: AtomicBool::new(false),
+                eval_current: false,
             };
 
-            // Warm-up (first launch of each kernel compiles it).
+            // Warm-up (first launch of each kernel compiles it). The grid counts buffer
+            // is primed once (production: `build_grid` zeroes it at allocation; the
+            // scatter self-cleans after every build).
             unsafe {
                 grid_zero::launch_unchecked::<u32>(
                     &client, CubeCount::Static(wgs(cells), 1, 1), CubeDim::new_1d(dim),
@@ -2016,11 +2025,17 @@
                     dt, gravity, num,
                 );
             });
-            let t_rp = bench(&client, ITERS, |c| unsafe {
-                copy_rho_prev::launch_unchecked::<f32>(
+            // The delta-SPH path (diffusion > 0) finishes the Verlet step and stages
+            // rho_prev in ONE fused kernel; the production default (diffusion == 0)
+            // skips the rho_prev staging entirely.
+            let t_fc = bench(&client, ITERS, |c| unsafe {
+                finish_verlet_copy_rho::launch_unchecked::<f32>(
                     c, CubeCount::Static(wgs(num), 1, 1), CubeDim::new_1d(dim),
+                    BufferArg::from_raw_parts(p.vel_b.clone(), num * 4),
+                    BufferArg::from_raw_parts(acc_h.clone(), num * 4),
                     BufferArg::from_raw_parts(state_h.clone(), num * 4),
-                    BufferArg::from_raw_parts(rho_prev_h.clone(), num * 4), num,
+                    BufferArg::from_raw_parts(rho_prev_h.clone(), num * 4),
+                    dt, gravity, num,
                 );
             });
             let t_vis = bench(&client, ITERS, |c| unsafe {
@@ -2058,19 +2073,16 @@
                     crate::domain::SIZE_F32.x, splat_cells, tx, ty,
                 );
             });
-            // Real back-to-back tick: 4 ping-pong substeps + vis, one sync.
+            // Real back-to-back tick: 4 substeps under the production scheduler
+            // (`sph_tick`: one grid build + one density pass per substep, density/grid
+            // reused for the first force evaluation of the next substep) + vis, one sync.
+            // One warm tick first so `eval_current` is set and the timed ticks are the
+            // steady-state loop (not the priming evaluation).
+            sph_tick(&client, &mut p, sph, dt, 4);
+            bevy::tasks::block_on(client.sync()).unwrap();
             let t_tick = bench(&client, 4, |c| {
-                let mut use_b = false;
-                for _ in 0..4 {
-                    let (pin, vin, pout, vout, st, ac) = if use_b {
-                        (&p.pos_b, &p.vel_b, &p.pos_a, &p.vel_a, &p.state_a, &p.acc_a)
-                    } else {
-                        (&p.pos_a, &p.vel_a, &p.pos_b, &p.vel_b, &p.state_b, &p.acc_b)
-                    };
-                    sph_substep(c, &p, pin, vin, pout, vout, st, ac, &p.rho_prev, dt, sph);
-                    use_b = !use_b;
-                }
-                let cur = if use_b { &p.pos_b } else { &p.pos_a };
+                sph_tick(c, &mut p, sph, dt, 4);
+                let cur = if p.current_is_b { &p.pos_b } else { &p.pos_a };
                 unsafe {
                     splat_clear::launch_unchecked::<u32>(
                         c, CubeCount::Static(wgs(cells_sq), 1, 1), CubeDim::new_1d(dim),
@@ -2095,8 +2107,8 @@
                 }
             });
 
-            let build = t_z + t_c + t_bt + t_bp + t_is + t_z + t_sc;
-            let substep = build + t_d + t_f + t_i + t_fin + t_rp;
+            let build = t_z + t_c + t_bt + t_bp + t_is + t_sc;
+            let substep = build + t_d + t_f + t_i + t_fin;
             eprintln!(
                 "[{label}] n={num:>7}  cells={cells}  (60 Hz budget 16.67 ms/tick)"
             );
@@ -2104,7 +2116,7 @@
                 "  grid:    zero {t_z:6.3} | count {t_c:6.3} | totals {t_bt:6.3} | prefix {t_bp:6.3} | scan {t_is:6.3} | scatter {t_sc:6.3}   build={build:7.3}"
             );
             eprintln!(
-                "  force:   density {t_d:7.3} | force+xsph {t_f:7.3}   | integrate {t_i:6.3} | finish {t_fin:6.3} | copy {t_rp:6.3}"
+                "  force:   density {t_d:7.3} | force+xsph {t_f:7.3}   | integrate {t_i:6.3} | finish {t_fin:6.3} | finish+copy {t_fc:6.3}"
             );
             eprintln!(
                 "  vis:     splat+surface {t_vis:8.3}    | substep {substep:8.3}   | tick(w/ vis) {t_tick:9.3}"
@@ -2117,6 +2129,184 @@
         eprintln!();
         eprintln!("=== summary ===");
         eprint!("{}", summary);
+    }
+
+    /// The production scheduler (`sph_tick`) must reproduce the reference `sph_substep`
+    /// loop: the scheduling reuse (grid + density carried across the substep boundary)
+    /// is position-preserving, so the sequence of force evaluations — and hence the
+    /// trajectory — is the same. Checked for both flavors: the default grid path with
+    /// delta-SPH off (density reuse) and the delta-SPH fallback (density recomputed),
+    /// over 4 substeps on a jittered blob. GPU-only (the grid needs atomics).
+    #[test]
+    fn reuse_tick_matches_reference() {
+        let Some(client) = test_gpu_client() else {
+            eprintln!("no GPU adapter; reuse equivalence skipped");
+            return;
+        };
+        let spacing = 0.5f32;
+        let h = spacing * 1.3;
+        let cell_inv = 1.0 / (2.0 * h);
+        let cells = (50usize, 7, 50);
+        let n_cells = cells.0 * cells.1 * cells.2;
+        let (nx, ny, nz) = (24usize, 3, 24);
+        let num = nx * ny * nz;
+        let (cx, cz) = (26.0f32, 26.0f32);
+        let mut pos = Vec::with_capacity(num * 4);
+        let mut vel = Vec::with_capacity(num * 4);
+        let mut state = Vec::with_capacity(num * 4);
+        let mut rng_state = 0x0badf00du32;
+        let mut rand = move || {
+            rng_state = rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (rng_state >> 8) as f32 / 16777216.0 - 0.5
+        };
+        for y in 0..ny {
+            for z in 0..nz {
+                for x in 0..nx {
+                    pos.push(cx + x as f32 * spacing + rand() * 0.08);
+                    pos.push(1.5 + y as f32 * spacing + rand() * 0.08);
+                    pos.push(cz + z as f32 * spacing + rand() * 0.08);
+                    pos.push(0.0);
+                    vel.push(rand() * 0.3);
+                    vel.push(rand() * 0.3);
+                    vel.push(rand() * 0.3);
+                    vel.push(0.0);
+                    state.push(1000.0 + rand() * 30.0);
+                    state.push(0.0);
+                    state.push(0.0);
+                    state.push(0.0);
+                }
+            }
+        }
+        let rho_prev = state.clone();
+
+        let alloc = |n: usize| client.empty(n * core::mem::size_of::<f32>());
+        let alloc_u = |n: usize| client.empty(n * core::mem::size_of::<u32>());
+        let mk = || {
+            let pos_h = alloc(pos.len());
+            let vel_h = alloc(vel.len());
+            let st = alloc(state.len());
+            let rp = alloc(state.len());
+            let acc = alloc(state.len());
+            client.write(&pos_h, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&pos).to_vec()));
+            client.write(&vel_h, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&vel).to_vec()));
+            client.write(&st, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&state).to_vec()));
+            client.write(&rp, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&rho_prev).to_vec()));
+            let tn = alloc(1);
+            let tdata = vec![0.0f32];
+            client.write(&tn, cubecl::bytes::Bytes::from_bytes_vec(f32::as_bytes(&tdata).to_vec()));
+            WaterParticles {
+                num,
+                capacity: num,
+                pos_a: pos_h.clone(),
+                pos_b: alloc(pos.len()),
+                vel_a: vel_h.clone(),
+                vel_b: alloc(vel.len()),
+                state_a: st.clone(),
+                state_b: alloc(state.len()),
+                rho_prev: rp,
+                acc_a: acc.clone(),
+                acc_b: alloc(state.len()),
+                xsph_delta: alloc(state.len()),
+                press_cache: alloc(state.len()),
+                terrain: tn,
+                terrain_x: 1,
+                terrain_y: 1,
+                grid_counts: alloc_u(n_cells),
+                grid_scan: alloc_u(n_cells + 1),
+                grid_list: alloc_u(num),
+                grid_totals: alloc_u(n_cells.div_ceil(64usize)),
+                grid_offsets: alloc_u(n_cells.div_ceil(64usize) + 1),
+                cells_x: cells.0,
+                cells_y: cells.1,
+                cells_z: cells.2,
+                cell_inv,
+                splat_counts: alloc_u(1),
+                splat: alloc(1),
+                surface_max: alloc_u(1),
+                surface: alloc(1),
+                cells: 1,
+                current_is_b: false,
+                grid_primed: AtomicBool::new(false),
+                eval_current: false,
+            }
+        };
+
+        let dt = 1.0 / 60.0 / 4.0;
+        let compare = |label: &str,
+                       reference: &WaterParticles,
+                       tick: &WaterParticles,
+                       diffusion: f32,
+                       pos_tol: f32,
+                       vel_tol: f32| {
+            let rb = client.read_one_unchecked(reference.pos_a.clone());
+            let tb = client.read_one_unchecked(tick.pos_a.clone());
+            let r = f32::from_bytes(&rb);
+            let t = f32::from_bytes(&tb);
+            let rvb = client.read_one_unchecked(reference.vel_a.clone());
+            let tvb = client.read_one_unchecked(tick.vel_a.clone());
+            let rv = f32::from_bytes(&rvb);
+            let tv = f32::from_bytes(&tvb);
+            let mut max_pos = 0.0f32;
+            let mut max_vel = 0.0f32;
+            for i in 0..num * 4 {
+                max_pos = max_pos.max((r[i] - t[i]).abs());
+                max_vel = max_vel.max((rv[i] - tv[i]).abs());
+            }
+            println!(
+                "reuse vs reference (diffusion={diffusion}): max|dpos| = {max_pos:e}, max|dvel| = {max_vel:e}"
+            );
+            assert!(max_pos < pos_tol, "{label}: positions diverged: {max_pos:e}");
+            assert!(max_vel < vel_tol, "{label}: velocities diverged: {max_vel:e}");
+        };
+
+        for (label, diffusion) in [("diffusion off", 0.0_f32), ("diffusion on", 0.05_f32)] {
+            let sph = SphParams {
+                h,
+                h2: h * h,
+                sigma: 1.0 / (core::f32::consts::PI * h * h * h),
+                mass: 125.0,
+                rho0: 1000.0,
+                rho_min_frac: 1.0,
+                b: 1000.0 * 40.0 * 40.0 / 7.0,
+                gamma: 7.0,
+                alpha: 0.3,
+                speed_of_sound: 40.0,
+                neighbor: NeighborSearch::UniformGrid,
+                domain: 64.0,
+                gravity: 9.81,
+                friction: 3.0,
+                boundary: BoundaryMode::Closed,
+                correction: BoundaryCorrection::Off,
+                xsph: 0.2,
+                diffusion,
+            };
+            let reference = mk();
+            // Reference: 4 substeps with 2 full evaluations each.
+            let mut use_b = false;
+            for _ in 0..4 {
+                let (pin, vin, pout, vout, st, ac) = if use_b {
+                    (&reference.pos_b, &reference.vel_b, &reference.pos_a, &reference.vel_a, &reference.state_a, &reference.acc_a)
+                } else {
+                    (&reference.pos_a, &reference.vel_a, &reference.pos_b, &reference.vel_b, &reference.state_b, &reference.acc_b)
+                };
+                sph_substep(
+                    &client, &reference, pin, vin, pout, vout, st, ac, &reference.rho_prev, dt, sph,
+                );
+                use_b = !use_b;
+            }
+            let mut tick = mk();
+            sph_tick(&client, &mut tick, sph, dt, 4);
+            // The delta-SPH path still recomputes the first evaluation: bit-identical.
+            // The default path reuses the previous end-of-step force for the half-step
+            // (standard velocity-Verlet): within one half-kick (a·dt/2) of the
+            // reference on the dissipative terms — tolerances here bound that.
+            let (pos_tol, vel_tol) = if diffusion > 0.0 {
+                (1e-4_f32, 1e-3_f32)
+            } else {
+                (1e-3_f32, 5e-2_f32)
+            };
+            compare(label, &reference, &tick, diffusion, pos_tol, vel_tol);
+        }
     }
 
     /// Probe: is the cached-pressure force (Phase A) bit-identical to the old inline
